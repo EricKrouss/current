@@ -5,8 +5,9 @@ import { createDefaultConfig } from '@current/config';
 import { createDb } from '../../apps/server/src/db/client.js';
 import { createAppContext } from '../../apps/server/src/create-context.js';
 import { buildApp } from '../../apps/server/src/app.js';
+import { InMemoryVoiceSfuAdapter } from '../../apps/server/src/voice/in-memory-voice-sfu-adapter.js';
 
-export async function createTestApp() {
+export async function createTestApp(options: { webDistDir?: string | false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'current-test-'));
   const dbPath = join(dir, 'current.sqlite');
   const uploads = join(dir, 'uploads');
@@ -40,13 +41,18 @@ export async function createTestApp() {
   });
 
   const db = createDb(config.storage.sqlitePath);
+  const voiceSfu = new InMemoryVoiceSfuAdapter({
+    getConfig: () => config,
+  });
+
   const context = createAppContext({
     db,
     config,
     configPath,
+    voiceSfu,
   });
 
-  const app = buildApp(context);
+  const app = buildApp(context, { webDistDir: options.webDistDir ?? false });
   await app.ready();
 
   async function close() {

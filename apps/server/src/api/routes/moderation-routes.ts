@@ -62,6 +62,15 @@ export async function registerModerationRoutes(app: FastifyInstance): Promise<vo
       return;
     }
 
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MANAGE_ROLES',
+    })) {
+      denyForbidden(reply, 'MANAGE_ROLES');
+      return;
+    }
+
     const role = app.appContext.moderation.createRole({
       ...body.data,
       serverId: status.serverId,
@@ -78,6 +87,15 @@ export async function registerModerationRoutes(app: FastifyInstance): Promise<vo
 
     if (!params.success || !body.success || !request.currentUser || !status.serverId) {
       reply.code(400).send({ error: 'Invalid request.' });
+      return;
+    }
+
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MANAGE_ROLES',
+    })) {
+      denyForbidden(reply, 'MANAGE_ROLES');
       return;
     }
 
@@ -102,6 +120,15 @@ export async function registerModerationRoutes(app: FastifyInstance): Promise<vo
 
     if (!params.success || !request.currentUser || !status.serverId) {
       reply.code(400).send({ error: 'Invalid request.' });
+      return;
+    }
+
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MANAGE_ROLES',
+    })) {
+      denyForbidden(reply, 'MANAGE_ROLES');
       return;
     }
 
@@ -198,11 +225,20 @@ export async function registerModerationRoutes(app: FastifyInstance): Promise<vo
     reply.send(channel);
   });
 
-  app.get('/automod/rules', { preHandler: [requireAuth] }, async (_request, reply) => {
+  app.get('/automod/rules', { preHandler: [requireAuth] }, async (request, reply) => {
     const status = app.appContext.setup.status();
 
-    if (!status.serverId) {
+    if (!status.serverId || !request.currentUser) {
       reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MODERATE_MEMBERS',
+    })) {
+      denyForbidden(reply, 'MODERATE_MEMBERS');
       return;
     }
 
@@ -215,6 +251,15 @@ export async function registerModerationRoutes(app: FastifyInstance): Promise<vo
 
     if (!body.success || !status.serverId || !request.currentUser) {
       reply.code(400).send({ error: 'Invalid request.' });
+      return;
+    }
+
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MODERATE_MEMBERS',
+    })) {
+      denyForbidden(reply, 'MODERATE_MEMBERS');
       return;
     }
 
@@ -234,6 +279,15 @@ export async function registerModerationRoutes(app: FastifyInstance): Promise<vo
 
     if (!params.success || !body.success || !status.serverId || !request.currentUser) {
       reply.code(400).send({ error: 'Invalid request.' });
+      return;
+    }
+
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MODERATE_MEMBERS',
+    })) {
+      denyForbidden(reply, 'MODERATE_MEMBERS');
       return;
     }
 
@@ -261,6 +315,15 @@ export async function registerModerationRoutes(app: FastifyInstance): Promise<vo
       return;
     }
 
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MODERATE_MEMBERS',
+    })) {
+      denyForbidden(reply, 'MODERATE_MEMBERS');
+      return;
+    }
+
     app.appContext.moderation.deleteAutomodRule({
       ruleId: params.data.ruleId,
       serverId: status.serverId,
@@ -282,10 +345,19 @@ export async function registerModerationRoutes(app: FastifyInstance): Promise<vo
     reply.send(app.appContext.moderation.listAuditLogs(status.serverId, query.data.limit ?? 100));
   });
 
-  app.get('/invites', { preHandler: [requireAuth] }, async (_request, reply) => {
+  app.get('/invites', { preHandler: [requireAuth] }, async (request, reply) => {
     const status = app.appContext.setup.status();
-    if (!status.serverId) {
+    if (!status.serverId || !request.currentUser) {
       reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MANAGE_SERVER',
+    })) {
+      denyForbidden(reply, 'MANAGE_SERVER');
       return;
     }
 
@@ -307,6 +379,15 @@ export async function registerModerationRoutes(app: FastifyInstance): Promise<vo
       return;
     }
 
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MANAGE_SERVER',
+    })) {
+      denyForbidden(reply, 'MANAGE_SERVER');
+      return;
+    }
+
     const invite = app.appContext.invites.create({
       serverId: status.serverId,
       createdBy: request.currentUser.id,
@@ -318,8 +399,18 @@ export async function registerModerationRoutes(app: FastifyInstance): Promise<vo
 
   app.delete('/invites/:code', { preHandler: [requireAuth] }, async (request, reply) => {
     const params = z.object({ code: z.string() }).safeParse(request.params);
-    if (!params.success) {
+    const status = app.appContext.setup.status();
+    if (!params.success || !request.currentUser || !status.serverId) {
       reply.code(400).send({ error: 'Invalid request.' });
+      return;
+    }
+
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MANAGE_SERVER',
+    })) {
+      denyForbidden(reply, 'MANAGE_SERVER');
       return;
     }
 

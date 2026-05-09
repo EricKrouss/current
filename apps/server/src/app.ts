@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import cookie from '@fastify/cookie';
@@ -11,14 +12,29 @@ import { registerMemberRoutes } from './api/routes/member-routes.js';
 import { registerChatRoutes } from './api/routes/chat-routes.js';
 import { registerModerationRoutes } from './api/routes/moderation-routes.js';
 import { registerVoiceRoutes } from './api/routes/voice-routes.js';
+import { registerPresenceRoutes } from './api/routes/presence-routes.js';
 import { registerMetricsRoutes } from './api/routes/metrics-routes.js';
 import { registerAdminRoutes } from './api/routes/admin-routes.js';
+import { registerWebClientRoutes } from './web-client.js';
 
-export function buildApp(context: AppContext) {
+export interface BuildAppOptions {
+  webDistDir?: string | false;
+}
+
+export function buildApp(context: AppContext, options: BuildAppOptions = {}) {
+  const tls = context.config.server.tls;
   const app = Fastify({
     logger: {
       level: context.config.observability.logLevel,
     },
+    ...(tls.enabled && tls.keyPath && tls.certPath
+      ? {
+          https: {
+            key: readFileSync(tls.keyPath),
+            cert: readFileSync(tls.certPath),
+          },
+        }
+      : {}),
   });
 
   app.decorate('appContext', context);
@@ -45,6 +61,10 @@ export function buildApp(context: AppContext) {
     context.metrics.recordRequest(reply.statusCode);
   });
 
+  app.addHook('onClose', async () => {
+    await context.voice.close();
+  });
+
   app.register(async (api) => {
     await registerMetricsRoutes(api);
     await registerSetupRoutes(api);
@@ -54,16 +74,11 @@ export function buildApp(context: AppContext) {
     await registerChatRoutes(api);
     await registerModerationRoutes(api);
     await registerVoiceRoutes(api);
+    await registerPresenceRoutes(api);
     await registerAdminRoutes(api);
   }, { prefix: '/api/v1' });
 
-  app.get('/', async () => {
-    return {
-      name: 'Current API',
-      version: '0.1.0',
-      docs: '/api/v1/health',
-    };
-  });
+  registerWebClientRoutes(app, options.webDistDir);
 
   context.gateway.attach(app.server);
 

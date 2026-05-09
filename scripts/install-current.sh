@@ -96,12 +96,14 @@ if [[ "$PM" == "pnpm" ]]; then
   pnpm --filter @current/types build
   pnpm --filter @current/protocol build
   pnpm --filter @current/config build
+  pnpm --filter @current/web build
   pnpm --filter @current/server build
 else
   npm install
   npm run build --workspace=@current/types
   npm run build --workspace=@current/protocol
   npm run build --workspace=@current/config
+  npm run build --workspace=@current/web
   npm run build --workspace=@current/server
 fi
 

@@ -1,4 +1,11 @@
-import type { AutomodRule, ModerationAction, Permission, Role } from '@current/types';
+import type {
+  AutomodRule,
+  ChannelPermissionOverwrite,
+  CurrentUser,
+  ModerationAction,
+  Permission,
+  Role,
+} from '@current/types';
 import type { RepositoryBag } from '../db/repositories/index.js';
 import type { MetricsService } from '../metrics/metrics-service.js';
 import { nowIso } from '../utils/time.js';
@@ -74,6 +81,75 @@ export class ModerationService {
       targetType: 'role',
       targetId: input.roleId,
       payload: {},
+    });
+  }
+
+  setMemberRoles(input: {
+    serverId: string;
+    actorId: string;
+    targetUserId: string;
+    roleIds: string[];
+  }): CurrentUser | null {
+    const user = this.repos.users.setRoles(input.targetUserId, input.roleIds);
+    if (!user) {
+      return null;
+    }
+
+    this.repos.audit.create({
+      serverId: input.serverId,
+      actorId: input.actorId,
+      action: 'member.roles.update',
+      targetType: 'user',
+      targetId: input.targetUserId,
+      payload: {
+        roleIds: input.roleIds,
+      },
+    });
+
+    return user;
+  }
+
+  replaceChannelOverwrites(input: {
+    serverId: string;
+    actorId: string;
+    channelId: string;
+    overwrites: Array<{
+      targetType: 'role' | 'user';
+      targetId: string;
+      allow: Permission[];
+      deny: Permission[];
+    }>;
+  }): ChannelPermissionOverwrite[] {
+    const overwrites = this.repos.channels.replaceOverwrites(input.channelId, input.overwrites);
+    this.repos.audit.create({
+      serverId: input.serverId,
+      actorId: input.actorId,
+      action: 'channel.permissions.update',
+      targetType: 'channel',
+      targetId: input.channelId,
+      payload: {
+        overwrites,
+      },
+    });
+    return overwrites;
+  }
+
+  deleteChannelOverwrite(input: {
+    serverId: string;
+    actorId: string;
+    channelId: string;
+    overwriteId: string;
+  }): void {
+    this.repos.channels.deleteOverwrite(input.overwriteId);
+    this.repos.audit.create({
+      serverId: input.serverId,
+      actorId: input.actorId,
+      action: 'channel.permissions.delete',
+      targetType: 'channel',
+      targetId: input.channelId,
+      payload: {
+        overwriteId: input.overwriteId,
+      },
     });
   }
 

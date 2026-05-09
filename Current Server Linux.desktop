@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Current Server
+Comment=Start the Current self-hosted chat server
+Terminal=true
+Exec=sh -c "launcher=\"\\$1\"; launcher=\"\\${launcher#file://}\"; dir=\\$(dirname \"\\$launcher\"); \"\\$dir/Current Server Linux.sh\"" current-server-launcher %k
+Icon=utilities-terminal
+Categories=Network;Chat;

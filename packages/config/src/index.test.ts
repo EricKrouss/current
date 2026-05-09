@@ -6,7 +6,16 @@ describe('config schema', () => {
     const config = createDefaultConfig({});
     expect(config.version).toBe(1);
     expect(config.server.registrationMode).toBe('invite_only');
+    expect(config.server.tls.enabled).toBe(false);
+    expect(config.auth.mode).toBe('atproto');
     expect(config.auth.lanRedirectBaseUrl).toBe('');
+    expect(config.media.gifProvider).toBe('klipy');
+    expect(config.media.gifFallbackProvider).toBe('none');
+    expect(config.media.giphyApiKey).toBe('');
+    expect(config.appearance.backgroundAttachmentId).toBe('');
+    expect(config.appearance.panelColor).toBe('');
+    expect(config.appearance.ownMessageColor).toBe('');
+    expect(config.appearance.otherMessageColor).toBe('');
   });
 
   it('migrates unknown versions into v1', () => {
@@ -48,6 +57,8 @@ describe('config schema', () => {
         announcedIp: '127.0.0.1',
         udpMinPort: 40000,
         udpMaxPort: 40100,
+        workerCount: 1,
+        sessionTimeoutMs: 45000,
         turnUrls: [],
       },
       observability: {
@@ -57,5 +68,7 @@ describe('config schema', () => {
     });
 
     expect(migrated.media.klipyApiKey).toBe('legacy-tenor-key');
+    expect(migrated.media.gifProvider).toBe('klipy');
+    expect(migrated.media.gifFallbackProvider).toBe('none');
   });
 });

@@ -70,12 +70,12 @@ export class AuthService {
     const displayName = profile.displayName ?? existing?.displayName ?? handle;
     const avatarUrl = profile.avatar ?? existing?.avatarUrl;
 
-    const user = this.repos.users.upsertByDid({
+    const user = this.ensureDefaultMemberRole(this.repos.users.upsertByDid({
       did,
       handle,
       displayName,
       avatarUrl,
-    });
+    }));
 
     const sessionToken = id('sess');
     this.repos.users.setSession(sessionToken, user.id, addHours(24));
@@ -88,6 +88,35 @@ export class AuthService {
     };
   }
 
+  async launcherLogin(input: {
+    did: string;
+    handle?: string;
+    displayName?: string;
+    avatar?: string;
+  }): Promise<{ user: CurrentUser; sessionToken: string }> {
+    const existing = this.repos.users.findByDid(input.did);
+    const profile = await this.fetchProfile(input.did);
+
+    const did = profile.did ?? input.did;
+    const handle =
+      this.normalizeResolvedHandle(profile.handle ?? input.handle) ?? existing?.handle ?? did;
+    const displayName =
+      profile.displayName ?? input.displayName?.trim() ?? existing?.displayName ?? handle;
+    const avatarUrl = profile.avatar ?? input.avatar ?? existing?.avatarUrl;
+
+    const user = this.ensureDefaultMemberRole(this.repos.users.upsertByDid({
+      did,
+      handle,
+      displayName,
+      avatarUrl,
+    }));
+
+    const sessionToken = id('sess');
+    this.repos.users.setSession(sessionToken, user.id, addHours(24));
+
+    return { user, sessionToken };
+  }
+
   async hydrateProfile(user: CurrentUser): Promise<CurrentUser> {
     const profile = await this.fetchProfile(user.did);
     const did = profile.did ?? user.did;
@@ -95,12 +124,12 @@ export class AuthService {
     const displayName = profile.displayName ?? user.displayName ?? handle;
     const avatarUrl = profile.avatar ?? user.avatarUrl;
 
-    return this.repos.users.upsertByDid({
+    return this.ensureDefaultMemberRole(this.repos.users.upsertByDid({
       did,
       handle,
       displayName,
       avatarUrl,
-    });
+    }));
   }
 
   devLogin(input?: { handle?: string; displayName?: string }): { user: CurrentUser; sessionToken: string } {
@@ -110,11 +139,45 @@ export class AuthService {
     const didSuffix = createHash('sha256').update(handle).digest('hex').slice(0, 24);
     const did = `did:current:dev:${didSuffix}`;
 
-    const user = this.repos.users.upsertByDid({
+    const user = this.ensureDefaultMemberRole(this.repos.users.upsertByDid({
       did,
       handle,
       displayName,
-    });
+    }));
+
+    const sessionToken = id('sess');
+    this.repos.users.setSession(sessionToken, user.id, addHours(24));
+
+    return { user, sessionToken };
+  }
+
+  lanLogin(input: { screenName: string }): { user: CurrentUser; sessionToken: string } {
+    const screenName = input.screenName.trim().replace(/\s+/g, ' ');
+    if (screenName.length < 2) {
+      throw new Error('Screen name must be at least 2 characters.');
+    }
+    if (screenName.length > 80) {
+      throw new Error('Screen name must be 80 characters or fewer.');
+    }
+
+    const slug = screenName
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40);
+    if (!slug) {
+      throw new Error('Screen name must contain letters or numbers.');
+    }
+
+    const handle = `${slug}.lan`;
+    const didSuffix = createHash('sha256').update(handle).digest('hex').slice(0, 24);
+    const did = `did:current:lan:${didSuffix}`;
+
+    const user = this.ensureDefaultMemberRole(this.repos.users.upsertByDid({
+      did,
+      handle,
+      displayName: screenName,
+    }));
 
     const sessionToken = id('sess');
     this.repos.users.setSession(sessionToken, user.id, addHours(24));
@@ -127,6 +190,23 @@ export class AuthService {
       return null;
     }
     return this.repos.users.findUserBySession(sessionToken);
+  }
+
+  private ensureDefaultMemberRole(user: CurrentUser): CurrentUser {
+    const server = this.repos.servers.getPrimaryServer();
+    if (!server) {
+      return user;
+    }
+
+    const memberRole = this.repos.roles
+      .list(server.id)
+      .find((role) => role.name.toLowerCase() === 'member');
+    if (!memberRole || user.roleIds.includes(memberRole.id)) {
+      return user;
+    }
+
+    this.repos.users.addRole(user.id, memberRole.id);
+    return this.repos.users.findById(user.id) ?? user;
   }
 
   logout(sessionToken?: string): void {
@@ -348,12 +428,20 @@ export class AuthService {
       if (!parsed.hostname) {
         throw new Error('Invalid server URL.');
       }
-      return parsed.hostname.toLowerCase();
+      parsed.pathname = '';
+      parsed.search = '';
+      parsed.hash = '';
+      return parsed.toString().replace(/\/$/, '');
     }
 
     const handle = input.startsWith('@') ? input.slice(1) : input;
     if (!handle) {
       throw new Error('Enter your Bluesky handle (for example: alice.bsky.social).');
+    }
+
+    const normalizedHandle = handle.toLowerCase();
+    if (normalizedHandle === 'bsky.social' || normalizedHandle === 'bsky.app') {
+      return 'https://bsky.social';
     }
 
     if (handle.includes('@')) {
@@ -369,7 +457,7 @@ export class AuthService {
       throw new Error('Handle contains invalid characters. Use letters, numbers, dots, and hyphens.');
     }
 
-    return handle.toLowerCase();
+    return normalizedHandle;
   }
 
   private isPrivateOrLoopbackHost(hostname: string): boolean {

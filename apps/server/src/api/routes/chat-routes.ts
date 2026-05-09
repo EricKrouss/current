@@ -3,34 +3,116 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { GatewayEvents } from '@current/protocol';
 import { requireAuth } from '../auth-guard.js';
-import { denyForbidden, hasServerPermission } from '../permission-guard.js';
+import { denyForbidden, hasChannelPermission, hasServerPermission } from '../permission-guard.js';
+import { decodeCursor } from '../../utils/cursor.js';
+
+const ChannelTypeSchema = z.enum(['category', 'text', 'voice', 'dm']);
+const ChannelPositionSchema = z.number().int().min(0).max(1_000_000_000);
 
 const ChannelCreateSchema = z.object({
   name: z.string().min(1),
-  type: z.enum(['text', 'voice', 'dm']),
-  categoryId: z.string().optional(),
+  type: ChannelTypeSchema,
+  categoryId: z.string().nullable().optional(),
   topic: z.string().optional(),
   slowmodeSeconds: z.number().int().min(0).optional(),
+  position: ChannelPositionSchema.optional(),
 });
 
 const ChannelPatchSchema = z.object({
-  categoryId: z.string().optional(),
+  categoryId: z.string().nullable().optional(),
   name: z.string().optional(),
-  type: z.enum(['text', 'voice', 'dm']).optional(),
+  type: ChannelTypeSchema.optional(),
   topic: z.string().optional(),
   slowmodeSeconds: z.number().int().min(0).optional(),
   locked: z.boolean().optional(),
+  position: ChannelPositionSchema.optional(),
 });
 
-const MessageCreateSchema = z.object({
-  content: z.string().max(4000),
-  parentMessageId: z.string().optional(),
-  gifUrl: z.string().url().optional(),
-  attachmentIds: z.array(z.string()).optional(),
+const ChannelOrderSchema = z.object({
+  items: z.array(z.object({
+    id: z.string().min(1),
+    categoryId: z.string().nullable().optional(),
+    position: ChannelPositionSchema,
+  })).min(1).max(500),
 });
 
-const MessagePatchSchema = z.object({
-  content: z.string().max(4000),
+const ChannelsQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  after: z.string().trim().min(1).max(1024).optional(),
+});
+
+const ChannelsAfterCursorSchema = z.object({
+  position: z.number().optional(),
+  createdAt: z.string().min(1),
+  id: z.string().min(1),
+});
+
+const EncryptedMessageContentSchema = z.object({
+  version: z.literal(1),
+  algorithm: z.literal('AES-GCM'),
+  keyId: z.string().trim().min(8).max(128),
+  nonce: z.string().trim().min(16).max(64),
+  ciphertext: z.string().trim().min(1).max(32768),
+});
+
+const MessageCreateSchema = z
+  .object({
+    content: z.string().max(4000).optional().default(''),
+    encryptedContent: EncryptedMessageContentSchema.optional(),
+    parentMessageId: z.string().optional(),
+    gifUrl: z.string().url().optional(),
+    attachmentIds: z.array(z.string()).optional(),
+  })
+  .superRefine((value, context) => {
+    if (value.encryptedContent && value.content.trim().length > 0) {
+      context.addIssue({
+        code: 'custom',
+        path: ['content'],
+        message: 'Encrypted messages must not include plaintext content.',
+      });
+    }
+  });
+
+const MessagePatchSchema = z
+  .object({
+    content: z.string().max(4000).optional().default(''),
+    encryptedContent: EncryptedMessageContentSchema.optional(),
+  })
+  .superRefine((value, context) => {
+    if (value.encryptedContent && value.content.trim().length > 0) {
+      context.addIssue({
+        code: 'custom',
+        path: ['content'],
+        message: 'Encrypted messages must not include plaintext content.',
+      });
+    }
+  });
+
+const MessagesQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  before: z.string().trim().min(1).max(1024).optional(),
+});
+
+const MessageSearchQuerySchema = z.object({
+  q: z.string().trim().max(200).optional(),
+  limit: z.coerce.number().int().min(1).max(50).optional(),
+  from: z.string().trim().min(1).max(128).optional(),
+});
+
+const ServerMessageSearchQuerySchema = z.object({
+  q: z.string().trim().max(200).optional(),
+  limit: z.coerce.number().int().min(1).max(50).optional(),
+  from: z.string().trim().min(1).max(128).optional(),
+  channelId: z.string().trim().min(1).max(128).optional(),
+});
+
+const MessagesBeforeCursorSchema = z.object({
+  createdAt: z.string().min(1),
+  id: z.string().min(1),
+});
+
+const TypingUpdateSchema = z.object({
+  isTyping: z.boolean().optional(),
 });
 
 const ReactionSchema = z.object({
@@ -38,13 +120,41 @@ const ReactionSchema = z.object({
 });
 
 export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
-  app.get('/channels', { preHandler: [requireAuth] }, async () => {
-    const status = app.appContext.setup.status();
-    if (!status.serverId) {
-      return [];
+  app.get('/channels', { preHandler: [requireAuth] }, async (request, reply) => {
+    const query = ChannelsQuerySchema.safeParse(request.query);
+    if (!query.success) {
+      reply.code(400).send({ error: query.error.flatten() });
+      return;
     }
 
-    return app.appContext.chat.listChannels(status.serverId);
+    const after = query.data.after
+      ? ChannelsAfterCursorSchema.safeParse(decodeCursor<unknown>(query.data.after))
+      : null;
+    if (query.data.after && (!after || !after.success)) {
+      reply.code(400).send({
+        error: {
+          code: 'INVALID_CURSOR',
+          message: 'Invalid pagination cursor.',
+        },
+      });
+      return;
+    }
+
+    const status = app.appContext.setup.status();
+    if (!status.serverId) {
+      return {
+        items: [],
+        pageInfo: {
+          hasMore: false,
+        },
+      };
+    }
+
+    return app.appContext.chat.listChannelsPage({
+      serverId: status.serverId,
+      limit: query.data.limit ?? 75,
+      after: after?.success ? after.data : undefined,
+    });
   });
 
   app.post('/channels', { preHandler: [requireAuth] }, async (request, reply) => {
@@ -69,11 +179,22 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       return;
     }
 
-    const channel = app.appContext.chat.createChannel({
-      ...parsed.data,
-      serverId: status.serverId,
-      actorId: request.currentUser.id,
-    });
+    let channel;
+    try {
+      channel = app.appContext.chat.createChannel({
+        ...parsed.data,
+        serverId: status.serverId,
+        actorId: request.currentUser.id,
+      });
+    } catch (error) {
+      reply.code(400).send({
+        error: {
+          code: 'INVALID_CHANNEL',
+          message: error instanceof Error ? error.message : 'Invalid channel.',
+        },
+      });
+      return;
+    }
 
     app.appContext.gateway.broadcast(GatewayEvents.PRESENCE_UPDATE, {
       action: 'channel_create',
@@ -81,6 +202,53 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
     });
 
     reply.code(201).send(channel);
+  });
+
+  app.put('/channels/order', { preHandler: [requireAuth] }, async (request, reply) => {
+    const parsed = ChannelOrderSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: parsed.error.flatten() });
+      return;
+    }
+
+    const status = app.appContext.setup.status();
+    if (!status.serverId || !request.currentUser) {
+      reply.code(401).send({ error: { code: 'NO_SERVER', message: 'No configured server.' } });
+      return;
+    }
+
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MANAGE_CHANNELS',
+    })) {
+      denyForbidden(reply, 'MANAGE_CHANNELS');
+      return;
+    }
+
+    let channels;
+    try {
+      channels = app.appContext.chat.reorderChannels({
+        serverId: status.serverId,
+        actorId: request.currentUser.id,
+        items: parsed.data.items,
+      });
+    } catch (error) {
+      reply.code(400).send({
+        error: {
+          code: 'INVALID_CHANNEL_ORDER',
+          message: error instanceof Error ? error.message : 'Invalid channel order.',
+        },
+      });
+      return;
+    }
+
+    app.appContext.gateway.broadcast(GatewayEvents.PRESENCE_UPDATE, {
+      action: 'channel_reorder',
+      channels,
+    });
+
+    reply.send({ items: channels });
   });
 
   app.patch('/channels/:channelId', { preHandler: [requireAuth] }, async (request, reply) => {
@@ -107,12 +275,23 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       return;
     }
 
-    const channel = app.appContext.chat.updateChannel({
-      channelId: params.data.channelId,
-      serverId: status.serverId,
-      actorId: request.currentUser.id,
-      patch: patch.data,
-    });
+    let channel;
+    try {
+      channel = app.appContext.chat.updateChannel({
+        channelId: params.data.channelId,
+        serverId: status.serverId,
+        actorId: request.currentUser.id,
+        patch: patch.data,
+      });
+    } catch (error) {
+      reply.code(400).send({
+        error: {
+          code: 'INVALID_CHANNEL',
+          message: error instanceof Error ? error.message : 'Invalid channel.',
+        },
+      });
+      return;
+    }
 
     if (!channel) {
       reply.code(404).send({ error: 'Channel not found.' });
@@ -163,11 +342,121 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
     reply.code(204).send();
   });
 
-  app.get('/channels/:channelId/messages', { preHandler: [requireAuth] }, async (request) => {
+  app.get('/channels/:channelId/messages', { preHandler: [requireAuth] }, async (request, reply) => {
     const params = z.object({ channelId: z.string() }).parse(request.params);
-    const query = z.object({ limit: z.coerce.number().int().min(1).max(200).optional() }).parse(request.query);
+    const query = MessagesQuerySchema.safeParse(request.query);
+    if (!query.success) {
+      reply.code(400).send({ error: query.error.flatten() });
+      return;
+    }
 
-    return app.appContext.chat.listMessages(params.channelId, query.limit ?? 50);
+    const before = query.data.before
+      ? MessagesBeforeCursorSchema.safeParse(decodeCursor<unknown>(query.data.before))
+      : null;
+    if (query.data.before && (!before || !before.success)) {
+      reply.code(400).send({
+        error: {
+          code: 'INVALID_CURSOR',
+          message: 'Invalid pagination cursor.',
+        },
+      });
+      return;
+    }
+
+    const identityMode = app.appContext.serverConfig.get().auth.mode === 'lan' ? 'lan' : 'atproto';
+    return app.appContext.chat.listMessagesPage({
+      channelId: params.channelId,
+      limit: query.data.limit ?? 40,
+      before: before?.success ? before.data : undefined,
+      identityMode,
+    });
+  });
+
+  app.get('/channels/:channelId/messages/search', { preHandler: [requireAuth] }, async (request, reply) => {
+    const params = z.object({ channelId: z.string() }).safeParse(request.params);
+    const query = MessageSearchQuerySchema.safeParse(request.query);
+    if (!params.success || !query.success) {
+      reply.code(400).send({ error: 'Invalid request.' });
+      return;
+    }
+
+    const channel = app.appContext.chat.getChannelById(params.data.channelId);
+    if (!channel) {
+      reply.code(404).send({ error: 'Channel not found.' });
+      return;
+    }
+
+    const identityMode = app.appContext.serverConfig.get().auth.mode === 'lan' ? 'lan' : 'atproto';
+    return {
+      items: app.appContext.chat.searchMessages({
+        channelId: params.data.channelId,
+        query: query.data.q,
+        limit: query.data.limit ?? 10,
+        authorId: query.data.from,
+        identityMode,
+      }),
+    };
+  });
+
+  app.get('/messages/search', { preHandler: [requireAuth] }, async (request, reply) => {
+    const query = ServerMessageSearchQuerySchema.safeParse(request.query);
+    if (!query.success) {
+      reply.code(400).send({ error: query.error.flatten() });
+      return;
+    }
+
+    const status = app.appContext.setup.status();
+    if (!status.serverId) {
+      return { items: [] };
+    }
+
+    if (query.data.channelId) {
+      const channel = app.appContext.chat.getChannelById(query.data.channelId);
+      if (!channel || channel.serverId !== status.serverId) {
+        reply.code(404).send({ error: 'Channel not found.' });
+        return;
+      }
+    }
+
+    const identityMode = app.appContext.serverConfig.get().auth.mode === 'lan' ? 'lan' : 'atproto';
+    return {
+      items: app.appContext.chat.searchMessagesInServer({
+        serverId: status.serverId,
+        query: query.data.q,
+        limit: query.data.limit ?? 10,
+        authorId: query.data.from,
+        channelId: query.data.channelId,
+        identityMode,
+      }),
+    };
+  });
+
+  app.get('/messages/:messageId', { preHandler: [requireAuth] }, async (request, reply) => {
+    const params = z.object({ messageId: z.string() }).safeParse(request.params);
+    if (!params.success) {
+      reply.code(400).send({ error: 'Invalid request.' });
+      return;
+    }
+
+    const status = app.appContext.setup.status();
+    if (!status.serverId) {
+      reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+
+    const identityMode = app.appContext.serverConfig.get().auth.mode === 'lan' ? 'lan' : 'atproto';
+    const message = app.appContext.chat.getMessageById({
+      messageId: params.data.messageId,
+      serverId: status.serverId,
+      identityMode,
+    });
+
+    if (!message) {
+      reply.code(404).send({ error: 'Message not found.' });
+      return;
+    }
+
+    reply.send(message);
   });
 
   app.post('/channels/:channelId/messages', { preHandler: [requireAuth] }, async (request, reply) => {
@@ -185,11 +474,48 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       return;
     }
 
+    const channel = app.appContext.chat.getChannelById(params.data.channelId);
+    if (!channel || channel.serverId !== status.serverId) {
+      reply.code(404).send({ error: 'Channel not found.' });
+      return;
+    }
+
+    if (!hasChannelPermission(app.appContext, {
+      serverId: status.serverId,
+      channelId: channel.id,
+      user: request.currentUser,
+      permission: 'SEND_MESSAGES',
+    })) {
+      denyForbidden(reply, 'SEND_MESSAGES');
+      return;
+    }
+
+    if ((body.data.attachmentIds?.length ?? 0) > 0 && !hasChannelPermission(app.appContext, {
+      serverId: status.serverId,
+      channelId: channel.id,
+      user: request.currentUser,
+      permission: 'ATTACH_FILES',
+    })) {
+      denyForbidden(reply, 'ATTACH_FILES');
+      return;
+    }
+
+    if (body.data.gifUrl && !hasChannelPermission(app.appContext, {
+      serverId: status.serverId,
+      channelId: channel.id,
+      user: request.currentUser,
+      permission: 'USE_GIFS',
+    })) {
+      denyForbidden(reply, 'USE_GIFS');
+      return;
+    }
+
     const result = app.appContext.chat.sendMessage({
       serverId: status.serverId,
       channelId: params.data.channelId,
       authorId: request.currentUser.id,
       content: body.data.content,
+      encryptedContent: body.data.encryptedContent,
       parentMessageId: body.data.parentMessageId,
       gifUrl: body.data.gifUrl,
       attachmentIds: body.data.attachmentIds,
@@ -212,18 +538,94 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
     reply.code(201).send(result.message);
   });
 
+  app.post('/channels/:channelId/typing', { preHandler: [requireAuth] }, async (request, reply) => {
+    const params = z.object({ channelId: z.string() }).safeParse(request.params);
+    const body = TypingUpdateSchema.safeParse(request.body ?? {});
+
+    if (!params.success || !body.success || !request.currentUser) {
+      reply.code(400).send({ error: 'Invalid request.' });
+      return;
+    }
+
+    const status = app.appContext.setup.status();
+    const channel = app.appContext.chat.getChannelById(params.data.channelId);
+    if (!channel) {
+      reply.code(404).send({ error: 'Channel not found.' });
+      return;
+    }
+
+    if (channel.type !== 'text' && channel.type !== 'dm') {
+      reply.code(409).send({
+        error: {
+          code: 'TYPING_UNSUPPORTED',
+          message: 'Typing indicators are only available in text channels and DMs.',
+        },
+      });
+      return;
+    }
+
+    if (!status.serverId || channel.serverId !== status.serverId) {
+      reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+
+    if (!hasChannelPermission(app.appContext, {
+      serverId: status.serverId,
+      channelId: channel.id,
+      user: request.currentUser,
+      permission: 'SEND_MESSAGES',
+    })) {
+      denyForbidden(reply, 'SEND_MESSAGES');
+      return;
+    }
+
+    app.appContext.gateway.broadcastTypingUpdate({
+      channelId: channel.id,
+      userId: request.currentUser.id,
+      isTyping: body.data.isTyping ?? true,
+    });
+
+    reply.code(204).send();
+  });
+
   app.patch('/messages/:messageId', { preHandler: [requireAuth] }, async (request, reply) => {
     const params = z.object({ messageId: z.string() }).safeParse(request.params);
     const body = MessagePatchSchema.safeParse(request.body);
 
-    if (!params.success || !body.success) {
+    if (!params.success || !body.success || !request.currentUser) {
       reply.code(400).send({ error: 'Invalid request.' });
+      return;
+    }
+
+    const status = app.appContext.setup.status();
+    if (!status.serverId) {
+      reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+
+    const existing = app.appContext.chat.getMessageById({
+      messageId: params.data.messageId,
+      serverId: status.serverId,
+    });
+    if (!existing) {
+      reply.code(404).send({ error: 'Message not found.' });
+      return;
+    }
+
+    if (existing.authorId !== request.currentUser.id && !hasChannelPermission(app.appContext, {
+      serverId: status.serverId,
+      channelId: existing.channelId,
+      user: request.currentUser,
+      permission: 'MANAGE_MESSAGES',
+    })) {
+      denyForbidden(reply, 'MANAGE_MESSAGES');
       return;
     }
 
     const message = app.appContext.chat.editMessage({
       messageId: params.data.messageId,
       content: body.data.content,
+      encryptedContent: body.data.encryptedContent,
     });
 
     if (!message) {
@@ -248,6 +650,25 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
     const status = app.appContext.setup.status();
     if (!status.serverId) {
       reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+
+    const existing = app.appContext.chat.getMessageById({
+      messageId: params.data.messageId,
+      serverId: status.serverId,
+    });
+    if (!existing) {
+      reply.code(404).send({ error: 'Message not found.' });
+      return;
+    }
+
+    if (existing.authorId !== request.currentUser.id && !hasChannelPermission(app.appContext, {
+      serverId: status.serverId,
+      channelId: existing.channelId,
+      user: request.currentUser,
+      permission: 'MANAGE_MESSAGES',
+    })) {
+      denyForbidden(reply, 'MANAGE_MESSAGES');
       return;
     }
 
@@ -278,13 +699,47 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       return;
     }
 
-    app.appContext.chat.addReaction({
+    const status = app.appContext.setup.status();
+    if (!status.serverId) {
+      reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+
+    const existing = app.appContext.chat.getMessageById({
+      messageId: params.data.messageId,
+      serverId: status.serverId,
+    });
+    if (!existing) {
+      reply.code(404).send({ error: 'Message not found.' });
+      return;
+    }
+
+    if (!hasChannelPermission(app.appContext, {
+      serverId: status.serverId,
+      channelId: existing.channelId,
+      user: request.currentUser,
+      permission: 'SEND_MESSAGES',
+    })) {
+      denyForbidden(reply, 'SEND_MESSAGES');
+      return;
+    }
+
+    const result = app.appContext.chat.toggleReaction({
       messageId: params.data.messageId,
       userId: request.currentUser.id,
       emoji: body.data.emoji,
     });
 
-    reply.code(204).send();
+    if (!result.message) {
+      reply.code(404).send({ error: 'Message not found.' });
+      return;
+    }
+
+    app.appContext.gateway.broadcast(GatewayEvents.MESSAGE_UPDATE, {
+      message: result.message,
+    });
+
+    reply.send(result.message);
   });
 
   app.post('/media/attachments', { preHandler: [requireAuth] }, async (request, reply) => {
@@ -344,11 +799,13 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       reply.send(data);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'GIF search failed.';
+      const provider = app.appContext.serverConfig.get().media.gifProvider;
       reply.send({
         results: [],
-        provider: 'klipy',
+        provider,
         providerError: {
-          code: 'KLIPY_ERROR',
+          provider,
+          code: `${provider.toUpperCase()}_ERROR`,
           message,
         },
       });

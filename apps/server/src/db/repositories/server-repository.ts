@@ -16,6 +16,8 @@ export class ServerRepository extends BaseRepository {
           name: string;
           slug: string;
           registration_mode: RegistrationMode;
+          icon_attachment_id: string | null;
+          banner_attachment_id: string | null;
           created_at: string;
         }
       | undefined;
@@ -29,6 +31,10 @@ export class ServerRepository extends BaseRepository {
       name: row.name,
       slug: row.slug,
       registrationMode: row.registration_mode,
+      iconAttachmentId: row.icon_attachment_id ?? undefined,
+      bannerAttachmentId: row.banner_attachment_id ?? undefined,
+      iconUrl: row.icon_attachment_id ? `/api/v1/media/attachments/${row.icon_attachment_id}` : undefined,
+      bannerUrl: row.banner_attachment_id ? `/api/v1/media/attachments/${row.banner_attachment_id}` : undefined,
       createdAt: row.created_at,
     };
   }
@@ -40,8 +46,8 @@ export class ServerRepository extends BaseRepository {
     this.db
       .prepare(
         `
-      INSERT INTO servers (id, name, slug, registration_mode, created_at)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO servers (id, name, slug, registration_mode, icon_attachment_id, banner_attachment_id, created_at)
+      VALUES (?, ?, ?, ?, NULL, NULL, ?)
     `,
       )
       .run(serverId, input.name, input.slug, input.registrationMode, createdAt);
@@ -55,15 +61,49 @@ export class ServerRepository extends BaseRepository {
     };
   }
 
-  updateRegistrationMode(serverId: string, registrationMode: RegistrationMode): void {
+  update(serverId: string, input: Partial<{
+    name: string;
+    slug: string;
+    registrationMode: RegistrationMode;
+    iconAttachmentId: string | null;
+    bannerAttachmentId: string | null;
+  }>): CurrentServer | null {
+    const existing = this.getPrimaryServer();
+    if (!existing || existing.id !== serverId) {
+      return null;
+    }
+
+    const next = {
+      name: input.name ?? existing.name,
+      slug: input.slug ?? existing.slug,
+      registrationMode: input.registrationMode ?? existing.registrationMode,
+      iconAttachmentId:
+        input.iconAttachmentId === undefined ? existing.iconAttachmentId ?? null : input.iconAttachmentId,
+      bannerAttachmentId:
+        input.bannerAttachmentId === undefined ? existing.bannerAttachmentId ?? null : input.bannerAttachmentId,
+    };
+
     this.db
       .prepare(
         `
       UPDATE servers
-      SET registration_mode = ?
+      SET name = ?, slug = ?, registration_mode = ?, icon_attachment_id = ?, banner_attachment_id = ?
       WHERE id = ?
     `,
       )
-      .run(registrationMode, serverId);
+      .run(
+        next.name,
+        next.slug,
+        next.registrationMode,
+        next.iconAttachmentId,
+        next.bannerAttachmentId,
+        serverId,
+      );
+
+    return this.getPrimaryServer();
+  }
+
+  updateRegistrationMode(serverId: string, registrationMode: RegistrationMode): void {
+    this.update(serverId, { registrationMode });
   }
 }

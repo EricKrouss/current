@@ -42,9 +42,11 @@ describe('channel delete cascade', () => {
     });
 
     expect(channelsResponse.statusCode).toBe(200);
-    const channels = channelsResponse.json() as Array<{ id: string; type: 'text' | 'voice' | 'dm' }>;
-    const textChannel = channels.find((channel) => channel.type === 'text');
-    const voiceChannel = channels.find((channel) => channel.type === 'voice');
+    const channels = channelsResponse.json() as {
+      items: Array<{ id: string; type: 'text' | 'voice' | 'dm' }>;
+    };
+    const textChannel = channels.items.find((channel) => channel.type === 'text');
+    const voiceChannel = channels.items.find((channel) => channel.type === 'voice');
 
     expect(textChannel?.id).toBeDefined();
     expect(voiceChannel?.id).toBeDefined();
@@ -74,7 +76,12 @@ describe('channel delete cascade', () => {
       },
     });
 
-    expect(reactionResponse.statusCode).toBe(204);
+    expect(reactionResponse.statusCode).toBe(200);
+    expect((reactionResponse.json() as { reactions?: Array<{ emoji: string; count: number }> }).reactions?.[0])
+      .toMatchObject({
+        emoji: '🔥',
+        count: 1,
+      });
 
     db.prepare(
       `

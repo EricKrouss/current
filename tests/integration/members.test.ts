@@ -44,9 +44,11 @@ describe('members integration', () => {
     });
 
     expect(response.statusCode).toBe(200);
-    const payload = response.json() as Array<{ displayName: string; avatarUrl?: string }>;
-    expect(payload.map((member) => member.displayName)).toEqual(['Alpha', 'Zeta']);
-    expect(payload.find((member) => member.displayName === 'Zeta')?.avatarUrl).toBe('https://example.com/zeta.png');
+    const payload = response.json() as {
+      items: Array<{ displayName: string; avatarUrl?: string }>;
+    };
+    expect(payload.items.map((member) => member.displayName)).toEqual(['Alpha', 'Zeta']);
+    expect(payload.items.find((member) => member.displayName === 'Zeta')?.avatarUrl).toBe('https://example.com/zeta.png');
 
     await close();
   });
@@ -136,10 +138,74 @@ describe('members integration', () => {
     });
 
     expect(response.statusCode).toBe(200);
-    const payload = response.json() as Array<{ id: string; displayName: string }>;
-    expect(payload.map((member) => member.id)).toEqual(['usr_admin']);
-    expect(payload.some((member) => member.displayName === 'Kicked User')).toBe(false);
-    expect(payload.some((member) => member.displayName === 'Banned User')).toBe(false);
+    const payload = response.json() as {
+      items: Array<{ id: string; displayName: string }>;
+    };
+    expect(payload.items.map((member) => member.id)).toEqual(['usr_admin']);
+    expect(payload.items.some((member) => member.displayName === 'Kicked User')).toBe(false);
+    expect(payload.items.some((member) => member.displayName === 'Banned User')).toBe(false);
+
+    await close();
+  });
+
+  it('hides Bluesky identities from members list when LAN mode is enabled', async () => {
+    const { app, context, db, close } = await createTestApp();
+
+    const config = context.serverConfig.get();
+    context.serverConfig.set({
+      ...config,
+      auth: {
+        ...config.auth,
+        mode: 'lan',
+      },
+    });
+
+    db.prepare(
+      `
+      INSERT INTO users (id, did, handle, display_name, avatar_url, created_at, updated_at)
+      VALUES (?, ?, ?, ?, NULL, ?, ?), (?, ?, ?, ?, NULL, ?, ?), (?, ?, ?, ?, NULL, ?, ?)
+    `,
+    ).run(
+      'usr_lan_1',
+      'did:current:lan:a1',
+      'lan-one.lan',
+      'LAN One',
+      nowIso(),
+      nowIso(),
+      'usr_lan_2',
+      'did:current:lan:a2',
+      'lan-two.lan',
+      'LAN Two',
+      nowIso(),
+      nowIso(),
+      'usr_bsky_1',
+      'did:plc:blue1',
+      'blue-one.bsky.social',
+      'Blue One',
+      nowIso(),
+      nowIso(),
+    );
+
+    db.prepare(
+      `
+      INSERT INTO sessions (token, user_id, expires_at, created_at)
+      VALUES (?, ?, ?, ?)
+    `,
+    ).run('lan_members_session', 'usr_lan_1', addHours(1), nowIso());
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/members',
+      cookies: {
+        current_session: 'lan_members_session',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const payload = response.json() as {
+      items: Array<{ id: string }>;
+    };
+    expect(payload.items.map((member) => member.id)).toEqual(['usr_lan_1', 'usr_lan_2']);
 
     await close();
   });

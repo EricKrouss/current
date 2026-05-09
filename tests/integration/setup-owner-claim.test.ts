@@ -3,6 +3,65 @@ import { createTestApp } from '../helpers/test-app.js';
 import { addHours, nowIso } from '../../apps/server/src/utils/time.js';
 
 describe('setup owner assignment', () => {
+  it('applies onboarding preferences and returns the default landing channel', async () => {
+    const { app, db, context, close } = await createTestApp();
+
+    const bootstrapResponse = await app.inject({
+      method: 'POST',
+      url: '/api/v1/setup/bootstrap',
+      payload: {
+        serverName: 'Onboarding Server',
+        slug: 'onboarding-server',
+        publicUrl: 'http://127.0.0.1:8080',
+        registrationMode: 'manual_approval',
+        initialPresenceStatus: 'away',
+        media: {
+          gifProvider: 'giphy',
+          gifFallbackProvider: 'klipy',
+          giphyApiKey: 'giphy-onboarding-key',
+          maxAttachmentBytes: 12 * 1024 * 1024,
+          allowedMimePrefixes: ['image/', 'video/'],
+        },
+        moderation: {
+          defaultSlowmodeSeconds: 5,
+          maxMentionsPerMessage: 4,
+          linkPolicy: 'allow',
+        },
+        adminDid: 'did:plc:onboarding-owner',
+        adminHandle: 'onboarding-owner.bsky.social',
+        adminDisplayName: 'Onboarding Owner',
+      },
+    });
+
+    expect(bootstrapResponse.statusCode).toBe(201);
+    const bootstrapPayload = bootstrapResponse.json() as { serverId: string; defaultChannelId: string };
+    expect(bootstrapPayload.serverId).toBeTruthy();
+    expect(bootstrapPayload.defaultChannelId).toBeTruthy();
+
+    const config = context.serverConfig.get();
+    expect(config.server.registrationMode).toBe('manual_approval');
+    expect(config.media.gifProvider).toBe('giphy');
+    expect(config.media.gifFallbackProvider).toBe('klipy');
+    expect(config.media.giphyApiKey).toBe('giphy-onboarding-key');
+    expect(config.media.maxAttachmentBytes).toBe(12 * 1024 * 1024);
+    expect(config.media.allowedMimePrefixes).toEqual(['image/', 'video/']);
+    expect(config.moderation.defaultSlowmodeSeconds).toBe(5);
+    expect(config.moderation.maxMentionsPerMessage).toBe(4);
+    expect(config.moderation.linkPolicy).toBe('allow');
+
+    const channels = context.repos.channels.listAll(bootstrapPayload.serverId);
+    expect(channels.map((channel) => channel.name)).toEqual(['general', 'lounge']);
+    expect(channels[0]?.id).toBe(bootstrapPayload.defaultChannelId);
+    expect(channels[0]?.slowmodeSeconds).toBe(5);
+
+    const ownerPresence = db
+      .prepare('SELECT selected_presence_status FROM users WHERE did = ?')
+      .get('did:plc:onboarding-owner') as { selected_presence_status: string } | undefined;
+    expect(ownerPresence?.selected_presence_status).toBe('away');
+
+    await close();
+  });
+
   it('auto-assigns the first authenticated user as owner/admin when no owner exists', async () => {
     const { app, db, close } = await createTestApp();
 

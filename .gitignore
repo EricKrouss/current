@@ -11,6 +11,7 @@ coverage
 
 # Local server runtime state
 apps/server/config/current.config.json
+apps/server/config/current-lan.config.json
 apps/server/data/
 apps/server/uploads/
 apps/server/backups/

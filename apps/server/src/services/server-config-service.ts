@@ -4,8 +4,37 @@ import {
   loadConfig,
   saveConfig,
   type CurrentConfig,
+  type DeepPartial,
 } from '@current/config';
 import type { RegistrationMode } from '@current/types';
+
+function mergeDefined<T>(base: T, patch: DeepPartial<T>): T {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+    return base;
+  }
+
+  const next = { ...(base as Record<string, unknown>) };
+  for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
+    if (value === undefined) {
+      continue;
+    }
+    const existing = next[key];
+    if (
+      value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      existing &&
+      typeof existing === 'object' &&
+      !Array.isArray(existing)
+    ) {
+      next[key] = mergeDefined(existing, value as DeepPartial<typeof existing>);
+    } else {
+      next[key] = value;
+    }
+  }
+
+  return next as T;
+}
 
 export class ServerConfigService {
   private config: CurrentConfig;
@@ -28,6 +57,19 @@ export class ServerConfigService {
     slug: string;
     publicUrl: string;
     registrationMode: RegistrationMode;
+    media?: {
+      gifProvider?: CurrentConfig['media']['gifProvider'];
+      gifFallbackProvider?: CurrentConfig['media']['gifFallbackProvider'];
+      klipyApiKey?: string;
+      giphyApiKey?: string;
+      maxAttachmentBytes?: number;
+      allowedMimePrefixes?: string[];
+    };
+    moderation?: {
+      defaultSlowmodeSeconds?: number;
+      maxMentionsPerMessage?: number;
+      linkPolicy?: CurrentConfig['moderation']['linkPolicy'];
+    };
   }): CurrentConfig {
     const merged = createDefaultConfig(this.config);
     const hadExplicitClientId = merged.auth.atprotoClientId.trim().length > 0;
@@ -35,6 +77,36 @@ export class ServerConfigService {
     merged.server.slug = input.slug;
     merged.server.publicUrl = input.publicUrl;
     merged.server.registrationMode = input.registrationMode;
+    if (input.media?.gifProvider) {
+      merged.media.gifProvider = input.media.gifProvider;
+    }
+    if (input.media?.gifFallbackProvider) {
+      merged.media.gifFallbackProvider =
+        input.media.gifFallbackProvider === merged.media.gifProvider ? 'none' : input.media.gifFallbackProvider;
+    } else if (merged.media.gifFallbackProvider === merged.media.gifProvider) {
+      merged.media.gifFallbackProvider = 'none';
+    }
+    if (input.media?.klipyApiKey !== undefined) {
+      merged.media.klipyApiKey = input.media.klipyApiKey.trim();
+    }
+    if (input.media?.giphyApiKey !== undefined) {
+      merged.media.giphyApiKey = input.media.giphyApiKey.trim();
+    }
+    if (input.media?.maxAttachmentBytes !== undefined) {
+      merged.media.maxAttachmentBytes = input.media.maxAttachmentBytes;
+    }
+    if (input.media?.allowedMimePrefixes !== undefined) {
+      merged.media.allowedMimePrefixes = input.media.allowedMimePrefixes;
+    }
+    if (input.moderation?.defaultSlowmodeSeconds !== undefined) {
+      merged.moderation.defaultSlowmodeSeconds = input.moderation.defaultSlowmodeSeconds;
+    }
+    if (input.moderation?.maxMentionsPerMessage !== undefined) {
+      merged.moderation.maxMentionsPerMessage = input.moderation.maxMentionsPerMessage;
+    }
+    if (input.moderation?.linkPolicy !== undefined) {
+      merged.moderation.linkPolicy = input.moderation.linkPolicy;
+    }
     if (!hadExplicitClientId) {
       const discoverableClientId = this.deriveDiscoverableClientIdFromPublicUrl(input.publicUrl);
       if (discoverableClientId) {
@@ -55,19 +127,42 @@ export class ServerConfigService {
 
   patchAdminSettings(input: {
     registrationMode?: RegistrationMode;
+    authMode?: 'atproto' | 'lan';
+    gifProvider?: CurrentConfig['media']['gifProvider'];
+    gifFallbackProvider?: CurrentConfig['media']['gifFallbackProvider'];
     klipyApiKey?: string;
+    giphyApiKey?: string;
     lanRedirectBaseUrl?: string;
   }): CurrentConfig {
     const merged = createDefaultConfig(this.config);
     if (input.registrationMode) {
       merged.server.registrationMode = input.registrationMode;
     }
+    if (input.authMode) {
+      merged.auth.mode = input.authMode;
+    }
+    if (input.gifProvider) {
+      merged.media.gifProvider = input.gifProvider;
+    }
+    if (input.gifFallbackProvider) {
+      merged.media.gifFallbackProvider = input.gifFallbackProvider;
+    }
     if (input.klipyApiKey !== undefined) {
       merged.media.klipyApiKey = input.klipyApiKey.trim();
+    }
+    if (input.giphyApiKey !== undefined) {
+      merged.media.giphyApiKey = input.giphyApiKey.trim();
     }
     if (input.lanRedirectBaseUrl !== undefined) {
       merged.auth.lanRedirectBaseUrl = input.lanRedirectBaseUrl.trim();
     }
+    this.set(merged);
+    return merged;
+  }
+
+  patchFullAdminSettings(input: DeepPartial<CurrentConfig>): CurrentConfig {
+    const current = createDefaultConfig(this.config);
+    const merged = createDefaultConfig(mergeDefined(current, input));
     this.set(merged);
     return merged;
   }

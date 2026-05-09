@@ -6,6 +6,24 @@ const BootstrapSchema = z.object({
   slug: z.string().min(2),
   publicUrl: z.string().url(),
   registrationMode: z.enum(['invite_only', 'open_signup', 'manual_approval']),
+  initialPresenceStatus: z.enum(['online', 'away', 'dnd', 'invisible']).optional(),
+  media: z
+    .object({
+      gifProvider: z.enum(['klipy', 'giphy']).optional(),
+      gifFallbackProvider: z.enum(['none', 'klipy', 'giphy']).optional(),
+      klipyApiKey: z.string().max(512).optional(),
+      giphyApiKey: z.string().max(512).optional(),
+      maxAttachmentBytes: z.number().int().positive().max(1024 * 1024 * 1024).optional(),
+      allowedMimePrefixes: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
+    })
+    .optional(),
+  moderation: z
+    .object({
+      defaultSlowmodeSeconds: z.number().int().min(0).max(86_400).optional(),
+      maxMentionsPerMessage: z.number().int().min(1).max(500).optional(),
+      linkPolicy: z.enum(['allow', 'members_only', 'deny']).optional(),
+    })
+    .optional(),
   adminDid: z.string().optional(),
   adminHandle: z.string().optional(),
   adminDisplayName: z.string().optional(),

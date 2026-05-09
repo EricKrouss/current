@@ -10,9 +10,11 @@ import type { MemberService } from '../services/member-service.js';
 import type { VoiceService } from '../voice/voice-service.js';
 import type { GatewayService } from '../realtime/gateway-service.js';
 import type { ServerConfigService } from '../services/server-config-service.js';
+import type { RepositoryBag } from '../db/repositories/index.js';
 
 export interface AppContext {
   db: DatabaseSync;
+  repos: RepositoryBag;
   config: CurrentConfig;
   configPath: string;
   metrics: MetricsService;

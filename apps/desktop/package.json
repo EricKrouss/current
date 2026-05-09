@@ -5,9 +5,9 @@
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
-    "dev": "pnpm --filter @current/web dev & pnpm --filter @current/desktop build && wait-on tcp:5173 && CURRENT_DEV=1 electron ./dist/main.js",
+    "dev": "pnpm --filter @current/web dev & pnpm --filter @current/desktop build && wait-on tcp:5173 && CURRENT_DEV=1 ./scripts/run-electron.sh",
     "build": "tsc -p tsconfig.json",
-    "start": "CURRENT_DEV=0 electron ./dist/main.js",
+    "start": "CURRENT_DEV=0 ./scripts/run-electron.sh",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --passWithNoTests"

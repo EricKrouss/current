@@ -1,20 +1,37 @@
-import type { CurrentUser } from '@current/types';
+import type { CurrentUser, PageResponse } from '@current/types';
 import type { RepositoryBag } from '../db/repositories/index.js';
+import type { CurrentConfig } from '@current/config';
 
 export class MemberService {
-  constructor(private readonly repos: RepositoryBag) {}
+  constructor(
+    private readonly repos: RepositoryBag,
+    private readonly getConfig: () => CurrentConfig,
+  ) {}
 
-  listMembers(serverId?: string): CurrentUser[] {
-    const allMembers = this.repos.users.list();
-    const visibleMembers = serverId
-      ? allMembers.filter(
-          (member) =>
-            !this.repos.moderation.isBanned(serverId, member.id) &&
-            !this.repos.moderation.isKicked(serverId, member.id),
-        )
-      : allMembers;
+  private resolveIdentityMode(): 'lan' | 'atproto' {
+    return this.getConfig().auth.mode === 'lan' ? 'lan' : 'atproto';
+  }
 
-    return visibleMembers.sort((a, b) => a.displayName.localeCompare(b.displayName) || a.handle.localeCompare(b.handle));
+  listMembersPage(input: {
+    serverId?: string;
+    limit: number;
+    after?: { displayName: string; handle: string; id: string };
+  }): PageResponse<CurrentUser> {
+    const identityMode = this.resolveIdentityMode();
+    if (!input.serverId) {
+      return this.repos.users.listMembersPage({
+        limit: input.limit,
+        after: input.after,
+        identityMode,
+      });
+    }
+
+    return this.repos.users.listVisibleMembersPage({
+      serverId: input.serverId,
+      limit: input.limit,
+      after: input.after,
+      identityMode,
+    });
   }
 
   recordClientIp(userId: string, ipAddress: string): void {

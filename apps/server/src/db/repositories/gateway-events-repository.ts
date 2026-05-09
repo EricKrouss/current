@@ -2,6 +2,9 @@ import type { DatabaseSync } from 'node:sqlite';
 import { BaseRepository } from './base-repository.js';
 import { nowIso } from '../../utils/time.js';
 
+const RETAINED_GATEWAY_EVENTS = 5_000;
+const GATEWAY_PRUNE_INTERVAL = 256;
+
 export interface GatewayEventRecord {
   seq: number;
   eventId: string;
@@ -26,7 +29,11 @@ export class GatewayEventsRepository extends BaseRepository {
       .run(input.eventId, input.type, JSON.stringify(input.payload), nowIso());
 
     const row = this.db.prepare('SELECT last_insert_rowid() as id').get() as { id: number };
-    return row.id;
+    const seq = row.id;
+    if (seq % GATEWAY_PRUNE_INTERVAL === 0) {
+      this.pruneBefore(seq - RETAINED_GATEWAY_EVENTS);
+    }
+    return seq;
   }
 
   listSince(seq: number, limit = 300): GatewayEventRecord[] {
@@ -62,5 +69,13 @@ export class GatewayEventsRepository extends BaseRepository {
       | { seq: number }
       | undefined;
     return row?.seq ?? 0;
+  }
+
+  private pruneBefore(cutoffSeq: number): void {
+    if (cutoffSeq <= 0) {
+      return;
+    }
+
+    this.db.prepare('DELETE FROM gateway_events WHERE seq < ?').run(cutoffSeq);
   }
 }

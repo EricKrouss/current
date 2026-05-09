@@ -26,23 +26,25 @@ describe('voice state service', () => {
     `,
     ).run('voice_chan', 'srv_1', null, 'voice', 'voice', null, 0, 0, new Date().toISOString());
 
-    const joined = context.voice.joinChannel({
+    const joined = await context.voice.joinChannel({
       userId: 'voice_user',
       channelId: 'voice_chan',
       pushToTalk: true,
     });
 
-    expect(joined.channelId).toBe('voice_chan');
-    expect(joined.pushToTalk).toBe(true);
+    expect(joined.voiceState.channelId).toBe('voice_chan');
+    expect(joined.voiceState.pushToTalk).toBe(true);
 
     const patched = context.voice.patchState({
       userId: 'voice_user',
+      muted: true,
       speaking: true,
     });
 
-    expect(patched?.speaking).toBe(true);
+    expect(patched?.muted).toBe(true);
+    expect(patched?.speaking).toBe(false);
 
-    context.voice.leaveChannel('voice_user');
+    await context.voice.leaveChannel('voice_user');
     expect(context.voice.patchState({ userId: 'voice_user', speaking: false })).toBeNull();
 
     await close();

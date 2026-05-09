@@ -10,7 +10,14 @@
   ],
   "scripts": {
     "build": "turbo run build",
-    "dev": "turbo run dev --parallel",
+    "dev": "pnpm --filter @current/server dev",
+    "dev:workspace": "turbo run dev --parallel",
+    "launch:server": "node scripts/start-current-server.mjs",
+    "launch:server:dev": "node scripts/start-current-server.mjs --mode=dev",
+    "launch:server:lan": "node scripts/start-current-server.mjs --instance=lan",
+    "launch:server:lan:dev": "node scripts/start-current-server.mjs --instance=lan --mode=dev",
+    "launch:server:lan:normal": "node scripts/start-current-server.mjs --instance=lan --mode=normal",
+    "launch:server:normal": "node scripts/start-current-server.mjs --mode=normal",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
@@ -29,5 +36,11 @@
     "turbo": "^2.5.8",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "mediasoup"
+    ]
   }
 }
