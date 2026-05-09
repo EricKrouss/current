@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { networkInterfaces } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -61,8 +61,64 @@ function resolvePackageManager() {
   return null;
 }
 
-function needsInstall() {
-  return !existsSync(join(rootDir, 'node_modules', '.pnpm')) || !existsSync(join(rootDir, 'apps', 'server', 'node_modules'));
+function displayPath(filePath) {
+  const path = relative(rootDir, filePath);
+  return path && !path.startsWith('..') ? path : filePath;
+}
+
+async function filesMatch(leftPath, rightPath) {
+  try {
+    const [left, right] = await Promise.all([
+      readFile(leftPath),
+      readFile(rightPath),
+    ]);
+    return left.equals(right);
+  } catch {
+    return false;
+  }
+}
+
+async function dependencyInstallReason() {
+  const requiredPaths = [
+    join(rootDir, 'node_modules', '.pnpm'),
+    join(rootDir, 'node_modules', '.bin', commandName('tsc')),
+    join(rootDir, 'apps', 'server', 'node_modules'),
+    join(rootDir, 'apps', 'web', 'node_modules'),
+  ];
+  const missingPath = requiredPaths.find((requiredPath) => !existsSync(requiredPath));
+  if (missingPath) {
+    return `missing ${displayPath(missingPath)}`;
+  }
+
+  const projectLockfile = join(rootDir, 'pnpm-lock.yaml');
+  const installedLockfile = join(rootDir, 'node_modules', '.pnpm', 'lock.yaml');
+  if (existsSync(projectLockfile)) {
+    if (!existsSync(installedLockfile)) {
+      return `missing ${displayPath(installedLockfile)}`;
+    }
+    if (!(await filesMatch(projectLockfile, installedLockfile))) {
+      return 'pnpm-lock.yaml changed since the last dependency install';
+    }
+  }
+
+  return null;
+}
+
+async function ensureDependencies(pm) {
+  console.log('[Current] Checking first-time setup...');
+  const reason = await dependencyInstallReason();
+  if (!reason) {
+    console.log('[Current] Dependencies are already installed and current.');
+    return;
+  }
+
+  if (checkOnly) {
+    throw new Error(`Dependencies need setup (${reason}). Run the launcher normally to install them.`);
+  }
+
+  console.log(`[Current] Dependencies need setup (${reason}).`);
+  console.log('[Current] Installing dependencies before choosing a server mode...');
+  await run(...pm(['install']), 'dependency install');
 }
 
 function resolveConfigPath(instance) {
@@ -524,13 +580,15 @@ async function main() {
   }
 
   const pm = (args) => [packageManager.command, [...packageManager.prefixArgs, ...args]];
+  console.log(`[Current] Repo: ${rootDir}`);
+  console.log(`[Current] Package manager: ${packageManager.label}`);
+  await ensureDependencies(pm);
+
   const instance = await chooseInstance();
   const configPath = await ensureInstanceConfig(instance);
   const mode = await chooseMode();
   const launchConfig = await readServerLaunchConfig(instance);
 
-  console.log(`[Current] Repo: ${rootDir}`);
-  console.log(`[Current] Package manager: ${packageManager.label}`);
   console.log(`[Current] Instance: ${instance}`);
   console.log(`[Current] Config: ${configPath}`);
   console.log(`[Current] Mode: ${mode}`);
@@ -550,11 +608,6 @@ async function main() {
   const shouldStart = await ensurePortAvailable(launchConfig);
   if (!shouldStart) {
     return;
-  }
-
-  if (needsInstall()) {
-    console.log('[Current] Installing dependencies. This is only needed on first launch or after dependency changes.');
-    await run(...pm(['install']), 'dependency install');
   }
 
   if (mode === 'dev') {

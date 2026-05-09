@@ -39,7 +39,7 @@ For a one-click local server, use the launcher for your OS:
 - macOS: double-click `Current Server.command`
 - Linux: double-click `Current Server Linux.desktop`, or `Current Server Linux.sh` if your desktop environment prefers shell launchers
 
-The launcher installs dependencies when needed, starts the server in a terminal, and keeps the terminal attached so you can stop it with `Ctrl+C`.
+The launcher checks first-time setup before any prompts, installs dependencies only when `node_modules` is missing or dependencies changed, starts the server in a terminal, and keeps the terminal attached so you can stop it with `Ctrl+C`.
 It will ask which server instance to run:
 
 - Standard: the normal Current server using `apps/server/config/current.config.json`
