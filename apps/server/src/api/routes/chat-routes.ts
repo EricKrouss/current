@@ -2,7 +2,11 @@ import { createReadStream } from 'node:fs';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { GatewayEvents } from '@current/protocol';
-import type { Channel, CurrentUser } from '@current/types';
+import type { Channel, CurrentUser, Message } from '@current/types';
+import type {
+  CurrentMessageNotificationPayload,
+  CurrentNotificationKind,
+} from '../../db/repositories/notification-events-repository.js';
 import { requireAuth } from '../auth-guard.js';
 import { denyForbidden, hasChannelPermission, hasServerPermission } from '../permission-guard.js';
 import { decodeCursor } from '../../utils/cursor.js';
@@ -91,6 +95,17 @@ function normalizeNotificationMentionHandles(handles: string[] | undefined): str
   return [...normalized];
 }
 
+function extractNotificationMentionHandles(content: string): string[] {
+  const handles = new Set<string>();
+  for (const match of content.matchAll(/@[A-Za-z0-9._-]+/g)) {
+    const handle = normalizeNotificationMentionHandle(match[0]);
+    if (handle) {
+      handles.add(handle);
+    }
+  }
+  return [...handles];
+}
+
 const MessagePatchSchema = z
   .object({
     content: z.string().max(4000).optional().default(''),
@@ -109,6 +124,11 @@ const MessagePatchSchema = z
 const MessagesQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
   before: z.string().trim().min(1).max(1024).optional(),
+});
+
+const CurrentNotificationsQuerySchema = z.object({
+  afterSeq: z.coerce.number().int().min(0).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
 });
 
 const MessageSearchQuerySchema = z.object({
@@ -183,6 +203,96 @@ function visibleMessageChannelIds(app: FastifyInstance, input: { serverId: strin
     .map((channel) => channel.id);
 }
 
+function notificationKindForTarget(input: {
+  mentioned: boolean;
+  replyToUser: boolean;
+}): CurrentNotificationKind {
+  return input.mentioned ? 'current_mention' : 'current_reply';
+}
+
+function recordCurrentNotificationEvents(
+  app: FastifyInstance,
+  input: {
+    serverId: string;
+    channelId: string;
+    gatewaySeq: number;
+    message: Message;
+    mentionHandles: string[];
+    replyToUserId?: string;
+  },
+): void {
+  const targets = new Map<
+    string,
+    {
+      user: CurrentUser;
+      mentioned: boolean;
+      replyToUser: boolean;
+      mentionHandles: Set<string>;
+    }
+  >();
+
+  const addTarget = (user: CurrentUser | null, patch: { mentionHandle?: string; replyToUser?: boolean }) => {
+    if (!user || user.id === input.message.authorId) {
+      return;
+    }
+
+    if (!canViewChannel(app, {
+      serverId: input.serverId,
+      channelId: input.channelId,
+      user,
+    })) {
+      return;
+    }
+
+    const existing = targets.get(user.id) ?? {
+      user,
+      mentioned: false,
+      replyToUser: false,
+      mentionHandles: new Set<string>(),
+    };
+
+    if (patch.mentionHandle) {
+      existing.mentioned = true;
+      existing.mentionHandles.add(patch.mentionHandle);
+    }
+    if (patch.replyToUser) {
+      existing.replyToUser = true;
+    }
+    targets.set(user.id, existing);
+  };
+
+  if (input.replyToUserId) {
+    addTarget(app.appContext.repos.users.findById(input.replyToUserId), { replyToUser: true });
+  }
+
+  for (const handle of input.mentionHandles) {
+    addTarget(app.appContext.repos.users.findByHandle(handle), { mentionHandle: handle });
+  }
+
+  for (const target of targets.values()) {
+    const notification: CurrentMessageNotificationPayload = {
+      ...(target.mentionHandles.size > 0 ? { mentionHandles: [...target.mentionHandles] } : {}),
+      ...(target.replyToUser ? { replyToUserId: target.user.id } : {}),
+    };
+
+    app.appContext.repos.notificationEvents.append({
+      gatewaySeq: input.gatewaySeq,
+      userId: target.user.id,
+      serverId: input.serverId,
+      channelId: input.channelId,
+      messageId: input.message.id,
+      kind: notificationKindForTarget({
+        mentioned: target.mentioned,
+        replyToUser: target.replyToUser,
+      }),
+      payload: {
+        message: input.message,
+        notification,
+      },
+    });
+  }
+}
+
 export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
   app.get('/channels', { preHandler: [requireAuth] }, async (request, reply) => {
     const query = ChannelsQuerySchema.safeParse(request.query);
@@ -214,21 +324,23 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       };
     }
 
-    if (!request.currentUser) {
+    const currentUser = request.currentUser;
+    const serverId = status.serverId;
+    if (!currentUser || !serverId) {
       reply.code(401).send({ error: 'Unauthorized.' });
       return;
     }
 
     const page = app.appContext.chat.listChannelsPage({
-      serverId: status.serverId,
+      serverId,
       limit: query.data.limit ?? 75,
       after: after?.success ? after.data : undefined,
     });
     return {
       ...page,
       items: filterVisibleChannels(app, {
-        serverId: status.serverId,
-        user: request.currentUser,
+        serverId,
+        user: currentUser,
         channels: page.items,
       }),
     };
@@ -421,6 +533,69 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
     });
 
     reply.code(204).send();
+  });
+
+  app.get('/notifications/current', { preHandler: [requireAuth] }, async (request, reply) => {
+    reply.header('cache-control', 'no-store');
+
+    const query = CurrentNotificationsQuerySchema.safeParse(request.query);
+    if (!query.success) {
+      reply.code(400).send({ error: query.error.flatten() });
+      return;
+    }
+
+    const status = app.appContext.setup.status();
+    if (!status.serverId) {
+      return {
+        items: [],
+        pageInfo: {
+          hasMore: false,
+          latestSeq: 0,
+        },
+      };
+    }
+
+    const currentUser = request.currentUser;
+    const serverId = status.serverId;
+    if (!currentUser || !serverId) {
+      reply.code(401).send({ error: 'Unauthorized.' });
+      return;
+    }
+
+    const afterSeq = query.data.afterSeq ?? 0;
+    const limit = query.data.limit ?? 100;
+    const latestSeq = app.appContext.repos.gatewayEvents.latestSeq();
+    const rows = app.appContext.repos.notificationEvents.listForUserSince({
+      userId: currentUser.id,
+      afterSeq,
+      limit: limit + 1,
+    });
+    const pageRows = rows.slice(0, limit);
+    const visibleRows = pageRows.filter((row) =>
+      canViewChannel(app, {
+        serverId,
+        channelId: row.channelId,
+        user: currentUser,
+      }),
+    );
+    const hasMore = rows.length > limit;
+    const lastScannedSeq = pageRows[pageRows.length - 1]?.seq ?? afterSeq;
+
+    return {
+      items: visibleRows.map((row) => ({
+        id: row.eventId,
+        seq: row.seq,
+        kind: row.kind,
+        message: row.payload.message,
+        notification: row.payload.notification,
+        createdAt: row.createdAt,
+      })),
+      pageInfo: {
+        hasMore,
+        nextAfterSeq: hasMore ? lastScannedSeq : undefined,
+        latestSeq: Math.max(latestSeq, lastScannedSeq),
+      },
+    };
   });
 
   app.get('/channels/:channelId/messages', { preHandler: [requireAuth] }, async (request, reply) => {
@@ -681,7 +856,10 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       return;
     }
 
-    const mentionHandles = normalizeNotificationMentionHandles(body.data.notificationMentions);
+    const mentionHandles = normalizeNotificationMentionHandles([
+      ...extractNotificationMentionHandles(body.data.content),
+      ...(body.data.notificationMentions ?? []),
+    ]);
     const identityMode = app.appContext.serverConfig.get().auth.mode === 'lan' ? 'lan' : 'atproto';
     const parentMessage = result.message.parentMessageId
       ? app.appContext.chat.getMessageById({
@@ -698,9 +876,17 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
           }
         : undefined;
 
-    app.appContext.gateway.broadcast(GatewayEvents.MESSAGE_CREATE, {
+    const gatewaySeq = app.appContext.gateway.broadcast(GatewayEvents.MESSAGE_CREATE, {
       message: result.message,
       ...(notification ? { notification } : {}),
+    });
+    recordCurrentNotificationEvents(app, {
+      serverId: status.serverId,
+      channelId: channel.id,
+      gatewaySeq,
+      message: result.message,
+      mentionHandles,
+      replyToUserId: parentMessage?.authorId,
     });
 
     reply.code(201).send(result.message);
@@ -1064,6 +1250,8 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
     reply
       .type(attachment.mimeType)
       .header('X-Content-Type-Options', 'nosniff')
+      .header('Content-Security-Policy', "sandbox; default-src 'none'; script-src 'none'; object-src 'none'")
+      .header('Cross-Origin-Resource-Policy', 'same-origin')
       .header('Content-Disposition', `inline; filename="${attachment.fileName.replace(/["\\\r\n]/g, '_')}"`);
     return reply.send(createReadStream(attachment.path));
   });

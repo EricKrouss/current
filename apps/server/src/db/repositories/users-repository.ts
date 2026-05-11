@@ -98,6 +98,18 @@ export class UsersRepository extends BaseRepository {
     return row ? this.findById(row.id) : null;
   }
 
+  findByHandle(handle: string): CurrentUser | null {
+    const normalized = handle.trim().replace(/^@/, '').toLowerCase();
+    if (!normalized) {
+      return null;
+    }
+
+    const row = this.db
+      .prepare('SELECT id FROM users WHERE LOWER(handle) = ? LIMIT 1')
+      .get(normalized) as { id: string } | undefined;
+    return row ? this.findById(row.id) : null;
+  }
+
   getPresenceStatus(userId: string): UserPresenceStatus {
     const row = this.db
       .prepare('SELECT selected_presence_status FROM users WHERE id = ?')

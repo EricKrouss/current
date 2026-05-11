@@ -219,6 +219,24 @@ export function runMigrations(db: DatabaseSync): void {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS notification_events (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      gateway_seq INTEGER NOT NULL,
+      event_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      server_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(user_id, message_id),
+      FOREIGN KEY (user_id) REFERENCES users(id),
+      FOREIGN KEY (server_id) REFERENCES servers(id),
+      FOREIGN KEY (channel_id) REFERENCES channels(id),
+      FOREIGN KEY (message_id) REFERENCES messages(id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_messages_channel_created ON messages(channel_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_messages_channel_created_id_not_deleted
       ON messages(channel_id, created_at DESC, id DESC)
@@ -234,6 +252,9 @@ export function runMigrations(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_moderation_server_target_type_created
       ON moderation_actions(server_id, target_user_id, type, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_gateway_events_seq ON gateway_events(seq);
+    CREATE INDEX IF NOT EXISTS idx_notification_events_user_gateway_seq
+      ON notification_events(user_id, gateway_seq ASC, seq ASC);
+    CREATE INDEX IF NOT EXISTS idx_notification_events_message ON notification_events(message_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_user_ip_address ON user_ip_activity(ip_address, last_seen_at DESC);
     CREATE INDEX IF NOT EXISTS idx_access_requests_server_status_requested

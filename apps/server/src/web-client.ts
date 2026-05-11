@@ -44,6 +44,7 @@ function sendStaticFile(reply: FastifyReply, filePath: string, immutable = false
     const body = readFileSync(filePath);
     reply.header('content-length', file.size);
     reply.header('cache-control', immutable ? 'public, max-age=31536000, immutable' : 'no-cache');
+    reply.header('x-content-type-options', 'nosniff');
     reply.send(body);
     return true;
   } catch {

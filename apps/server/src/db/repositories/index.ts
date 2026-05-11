@@ -7,6 +7,7 @@ import { GatewayEventsRepository } from './gateway-events-repository.js';
 import { InvitesRepository } from './invites-repository.js';
 import { MessagesRepository } from './messages-repository.js';
 import { ModerationRepository } from './moderation-repository.js';
+import { NotificationEventsRepository } from './notification-events-repository.js';
 import { RolesRepository } from './roles-repository.js';
 import { ServerRepository } from './server-repository.js';
 import { SettingsRepository } from './settings-repository.js';
@@ -26,6 +27,7 @@ export interface RepositoryBag {
   accessRequests: AccessRequestsRepository;
   automod: AutomodRepository;
   moderation: ModerationRepository;
+  notificationEvents: NotificationEventsRepository;
   audit: AuditRepository;
   gatewayEvents: GatewayEventsRepository;
   voiceStates: VoiceStatesRepository;
@@ -44,6 +46,7 @@ export function createRepositories(db: DatabaseSync): RepositoryBag {
     accessRequests: new AccessRequestsRepository(db),
     automod: new AutomodRepository(db),
     moderation: new ModerationRepository(db),
+    notificationEvents: new NotificationEventsRepository(db),
     audit: new AuditRepository(db),
     gatewayEvents: new GatewayEventsRepository(db),
     voiceStates: new VoiceStatesRepository(db),

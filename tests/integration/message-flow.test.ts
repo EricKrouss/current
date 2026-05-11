@@ -156,6 +156,20 @@ describe('chat message integration', () => {
         bytes: Buffer.from('<svg><script>alert(1)</script></svg>'),
       }),
     ).toThrow('Attachment MIME type is not safe to serve.');
+    expect(() =>
+      context.chat.saveAttachment({
+        fileName: 'payload.js',
+        mimeType: 'application/javascript',
+        bytes: Buffer.from('alert(1)'),
+      }),
+    ).toThrow('Attachment MIME type is not safe to serve.');
+    expect(() =>
+      context.chat.saveAttachment({
+        fileName: 'look-ma-image.exe',
+        mimeType: 'image/png',
+        bytes: Buffer.from('not-really-a-png'),
+      }),
+    ).toThrow('Attachment file type is not safe to serve.');
     const attachmentMessageResponse = await app.inject({
       method: 'POST',
       url: `/api/v1/channels/${textChannel?.id}/messages`,

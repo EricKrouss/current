@@ -49,6 +49,19 @@ const RestartRequiredFieldPaths = [
   'rtc.turnCredential',
   'observability.logLevel',
 ];
+const HostOnlyAdminSettingsFieldPaths = [
+  'server.host',
+  'server.port',
+  'server.tls',
+  'storage',
+  'auth.authorizationEndpoint',
+  'auth.tokenEndpoint',
+  'auth.profileEndpoint',
+  'auth.cookieSecret',
+  'auth.allowDevLogin',
+  'rtc',
+  'observability',
+];
 
 const AdminSettingsPatchSchema = z
   .object({
@@ -392,6 +405,21 @@ function getByPath(value: unknown, path: string): unknown {
   }, value);
 }
 
+function hasOwnPath(value: unknown, path: string): boolean {
+  let current = value;
+  for (const segment of path.split('.')) {
+    if (!current || typeof current !== 'object' || !Object.prototype.hasOwnProperty.call(current, segment)) {
+      return false;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current !== undefined;
+}
+
+function requestedHostOnlyAdminSettings(body: z.infer<typeof AdminSettingsPatchSchema>): string[] {
+  return HostOnlyAdminSettingsFieldPaths.filter((path) => hasOwnPath(body, path));
+}
+
 function changedRestartFields(before: CurrentConfig, after: CurrentConfig): string[] {
   return RestartRequiredFieldPaths.filter((path) => {
     return JSON.stringify(getByPath(before, path)) !== JSON.stringify(getByPath(after, path));
@@ -696,6 +724,18 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     }
 
     if (!ensureManageServerPermission(app, request, reply, status.serverId)) {
+      return;
+    }
+
+    const hostOnlyFields = requestedHostOnlyAdminSettings(body.data);
+    if (hostOnlyFields.length > 0 && !isRequestFromHostMachine(request)) {
+      reply.code(403).send({
+        error: {
+          code: 'HOST_ONLY',
+          message: 'Host-level server settings can only be changed from the host machine.',
+          fields: hostOnlyFields,
+        },
+      });
       return;
     }
 

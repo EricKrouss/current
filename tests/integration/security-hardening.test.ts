@@ -68,6 +68,36 @@ async function expectGatewayReady(input: {
   });
 }
 
+async function expectGatewayReadyWithProtocolSession(input: {
+  url: string;
+  origin: string;
+  sessionToken: string;
+}): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const socket = new WebSocket(
+      input.url,
+      ['current-session', `current-session-token.${Buffer.from(input.sessionToken, 'utf8').toString('base64url')}`],
+      {
+        headers: {
+          Origin: input.origin,
+        },
+      },
+    );
+
+    socket.once('message', (raw) => {
+      try {
+        const payload = JSON.parse(raw.toString()) as { type?: string };
+        expect(payload.type).toBe('READY');
+        socket.close();
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    });
+    socket.once('error', reject);
+  });
+}
+
 async function expectGatewayDoesNotReplayMessage(input: {
   url: string;
   origin: string;
@@ -168,6 +198,11 @@ describe('security hardening', () => {
       sessionToken,
     });
     await expectGatewayReady({
+      url: gatewayUrl,
+      origin: `http://127.0.0.1:${port}`,
+      sessionToken,
+    });
+    await expectGatewayReadyWithProtocolSession({
       url: gatewayUrl,
       origin: `http://127.0.0.1:${port}`,
       sessionToken,
@@ -660,6 +695,8 @@ describe('security hardening', () => {
         },
       });
       expect(ownerRead.statusCode).toBe(200);
+      expect(ownerRead.headers['x-content-type-options']).toBe('nosniff');
+      expect(ownerRead.headers['content-security-policy']).toContain("script-src 'none'");
 
       const otherRead = await app.inject({
         method: 'GET',

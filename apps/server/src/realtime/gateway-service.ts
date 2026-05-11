@@ -356,8 +356,9 @@ export class GatewayService {
   private authenticateWs(request: IncomingMessage): AuthenticatedSocketSession | null {
     const url = new URL(request.url ?? '', 'http://localhost');
     const sessionToken =
-      url.searchParams.get('session') ??
-      this.readSessionFromCookieHeader(request.headers.cookie ?? undefined);
+      this.readSessionFromProtocolHeader(request.headers['sec-websocket-protocol']) ??
+      this.readSessionFromCookieHeader(request.headers.cookie ?? undefined) ??
+      url.searchParams.get('session');
 
     if (!sessionToken) {
       return null;
@@ -404,6 +405,30 @@ export class GatewayService {
       const trimmed = part.trim();
       if (trimmed.startsWith('current_session=')) {
         return decodeURIComponent(trimmed.slice('current_session='.length));
+      }
+    }
+
+    return null;
+  }
+
+  private readSessionFromProtocolHeader(protocolHeader?: string | string[]): string | null {
+    const header = Array.isArray(protocolHeader) ? protocolHeader.join(',') : protocolHeader;
+    if (!header) {
+      return null;
+    }
+
+    for (const part of header.split(',')) {
+      const protocol = part.trim();
+      if (!protocol.startsWith('current-session-token.')) {
+        continue;
+      }
+
+      try {
+        const encoded = protocol.slice('current-session-token.'.length);
+        const decoded = Buffer.from(encoded, 'base64url').toString('utf8');
+        return decoded.length > 0 ? decoded : null;
+      } catch {
+        return null;
       }
     }
 

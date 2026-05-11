@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { extname, isAbsolute, relative, resolve } from 'node:path';
 import { lookup as lookupMime } from 'mime-types';
 import type { Attachment, Channel, ChannelType, EncryptedMessageContent, Message, PageResponse } from '@current/types';
 import type { RepositoryBag } from '../db/repositories/index.js';
@@ -36,11 +36,55 @@ const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 const MAX_PENDING_ATTACHMENTS_PER_USER = 20;
 const MIN_PENDING_ATTACHMENT_BYTES_PER_USER = 64 * 1024 * 1024;
 const BLOCKED_ATTACHMENT_MIME_TYPES = new Set([
+  'application/ecmascript',
+  'application/javascript',
   'application/xhtml+xml',
+  'application/x-msdownload',
+  'application/x-sh',
   'image/svg+xml',
+  'text/css',
+  'text/ecmascript',
   'text/html',
+  'text/javascript',
   'text/xml',
 ]);
+const BLOCKED_ATTACHMENT_MIME_PREFIXES = ['text/'];
+const BLOCKED_ATTACHMENT_EXTENSIONS = new Set([
+  '.app',
+  '.bat',
+  '.bash',
+  '.cmd',
+  '.com',
+  '.cjs',
+  '.desktop',
+  '.dll',
+  '.exe',
+  '.fish',
+  '.hta',
+  '.htm',
+  '.html',
+  '.jar',
+  '.js',
+  '.jsx',
+  '.lnk',
+  '.mjs',
+  '.msi',
+  '.ps1',
+  '.reg',
+  '.scr',
+  '.service',
+  '.sh',
+  '.svg',
+  '.ts',
+  '.tsx',
+  '.vbs',
+  '.wasm',
+  '.wsf',
+  '.xhtml',
+  '.xml',
+  '.zsh',
+]);
+const MAX_STORED_ATTACHMENT_FILENAME_LENGTH = 180;
 
 function isPathInsideDirectory(parent: string, child: string): boolean {
   const relativePath = relative(resolve(parent), resolve(child));
@@ -49,6 +93,23 @@ function isPathInsideDirectory(parent: string, child: string): boolean {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'GIF search failed.';
+}
+
+function normalizeAttachmentFileName(fileName: string): string {
+  const lastSegment = fileName.replace(/\\/g, '/').split('/').pop() ?? '';
+  const cleaned = lastSegment.replace(/[\0\r\n]/g, '_').trim();
+  return (cleaned || 'attachment').slice(0, MAX_STORED_ATTACHMENT_FILENAME_LENGTH);
+}
+
+function isBlockedAttachmentMimeType(mimeType: string): boolean {
+  return (
+    BLOCKED_ATTACHMENT_MIME_TYPES.has(mimeType) ||
+    BLOCKED_ATTACHMENT_MIME_PREFIXES.some((prefix) => mimeType.startsWith(prefix))
+  );
+}
+
+function isBlockedAttachmentExtension(fileName: string): boolean {
+  return BLOCKED_ATTACHMENT_EXTENSIONS.has(extname(fileName).toLowerCase());
 }
 
 function getProviderLabel(provider: GifProvider): string {
@@ -90,7 +151,7 @@ export class ChatService {
     private readonly moderation: ModerationService,
     private readonly getConfig: () => CurrentConfig,
   ) {
-    mkdirSync(this.getConfig().storage.uploadDir, { recursive: true });
+    mkdirSync(this.getConfig().storage.uploadDir, { recursive: true, mode: 0o700 });
   }
 
   listChannelsPage(input: {
@@ -460,7 +521,8 @@ export class ChatService {
       }
     }
 
-    const detectedMime = input.mimeType ?? lookupMime(input.fileName);
+    const fileName = normalizeAttachmentFileName(input.fileName);
+    const detectedMime = input.mimeType ?? lookupMime(fileName);
     const mimeType = (typeof detectedMime === 'string' ? detectedMime : 'application/octet-stream')
       .split(';')[0]
       .trim()
@@ -470,16 +532,19 @@ export class ChatService {
     if (!allowed) {
       throw new Error('Attachment MIME type is not allowed.');
     }
-    if (BLOCKED_ATTACHMENT_MIME_TYPES.has(mimeType)) {
+    if (isBlockedAttachmentMimeType(mimeType)) {
       throw new Error('Attachment MIME type is not safe to serve.');
     }
+    if (isBlockedAttachmentExtension(fileName)) {
+      throw new Error('Attachment file type is not safe to serve.');
+    }
 
-    const safeName = `${Date.now()}-${input.fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    const safeName = `${Date.now()}-${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
     const filePath = resolve(config.storage.uploadDir, safeName);
-    writeFileSync(filePath, input.bytes);
+    writeFileSync(filePath, input.bytes, { mode: 0o600 });
 
     return this.repos.messages.recordUploadedAttachment({
-      fileName: input.fileName,
+      fileName,
       mimeType,
       byteSize: input.bytes.length,
       path: filePath,

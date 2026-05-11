@@ -268,6 +268,88 @@ describe('admin settings and insights', () => {
     await close();
   });
 
+  it('requires host-machine access before changing host-level server settings', async () => {
+    const { app, db, context, close } = await createTestApp();
+
+    try {
+      const bootstrapResponse = await app.inject({
+        method: 'POST',
+        url: '/api/v1/setup/bootstrap',
+        payload: {
+          serverName: 'Host Settings Server',
+          slug: 'host-settings-server',
+          publicUrl: 'http://127.0.0.1:8080',
+          registrationMode: 'invite_only',
+          adminDid: 'did:plc:host-settings-owner',
+          adminHandle: 'host-settings-owner.bsky.social',
+          adminDisplayName: 'Host Settings Owner',
+        },
+      });
+      expect(bootstrapResponse.statusCode).toBe(201);
+
+      const owner = db
+        .prepare('SELECT id FROM users WHERE did = ?')
+        .get('did:plc:host-settings-owner') as { id: string };
+
+      db.prepare(
+        `
+        INSERT INTO sessions (token, user_id, expires_at, created_at)
+        VALUES (?, ?, ?, ?)
+      `,
+      ).run('host_settings_owner_session', owner.id, addHours(1), nowIso());
+
+      const originalUploadDir = context.serverConfig.get().storage.uploadDir;
+      const denied = await app.inject({
+        method: 'PATCH',
+        url: '/api/v1/admin/settings',
+        headers: {
+          'x-forwarded-for': '203.0.113.10',
+        },
+        cookies: {
+          current_session: 'host_settings_owner_session',
+        },
+        payload: {
+          storage: {
+            uploadDir: '/tmp/current-chat-remote-write',
+          },
+          server: {
+            tls: {
+              keyPath: '/tmp/current-chat-key.pem',
+            },
+          },
+        },
+      });
+      expect(denied.statusCode).toBe(403);
+      expect(denied.json()).toMatchObject({
+        error: {
+          code: 'HOST_ONLY',
+          fields: expect.arrayContaining(['storage', 'server.tls']),
+        },
+      });
+      expect(context.serverConfig.get().storage.uploadDir).toBe(originalUploadDir);
+
+      const allowedCosmeticPatch = await app.inject({
+        method: 'PATCH',
+        url: '/api/v1/admin/settings',
+        headers: {
+          'x-forwarded-for': '203.0.113.10',
+        },
+        cookies: {
+          current_session: 'host_settings_owner_session',
+        },
+        payload: {
+          server: {
+            name: 'Remote Cosmetic Rename',
+          },
+        },
+      });
+      expect(allowedCosmeticPatch.statusCode).toBe(200);
+      expect(context.serverConfig.get().server.name).toBe('Remote Cosmetic Rename');
+    } finally {
+      await close();
+    }
+  });
+
   it('does not require an optional background wallpaper when saving appearance settings', async () => {
     const { app, db, context, close } = await createTestApp();
 
