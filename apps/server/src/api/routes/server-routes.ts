@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { requireAuth } from '../auth-guard.js';
 import { buildPublicServerPayload } from './server-payload.js';
+import { denyForbidden, hasServerPermission } from '../permission-guard.js';
 
 const E2EE_ROOM_KEY_SETTING = 'e2ee:room-key:v1';
 
@@ -187,6 +188,14 @@ export async function registerServerRoutes(app: FastifyInstance): Promise<void> 
           message: 'Server is not configured yet.',
         },
       });
+      return;
+    }
+    if (!request.currentUser || !hasServerPermission(app.appContext, {
+      serverId: primary.serverId,
+      user: request.currentUser,
+      permission: 'MANAGE_SERVER',
+    })) {
+      denyForbidden(reply, 'MANAGE_SERVER');
       return;
     }
 

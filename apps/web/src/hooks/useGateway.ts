@@ -50,8 +50,19 @@ export function useGateway(enabled: boolean, onEvent: (event: GatewayEnvelope) =
       }
     });
 
-    socket.addEventListener('close', () => {
+    socket.addEventListener('close', (event) => {
       setStatus('offline');
+      if (event.code === 1008 && event.reason.trim().length > 0) {
+        onEvent({
+          id: `close_${Date.now()}`,
+          type: 'GATEWAY_CLOSE',
+          payload: {
+            code: event.code,
+            reason: event.reason,
+          },
+          sentAt: new Date().toISOString(),
+        });
+      }
     });
 
     return () => {

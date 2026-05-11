@@ -174,9 +174,40 @@ describe('voice SFU signaling routes', () => {
       },
     });
     expect(consumeResponse.statusCode).toBe(200);
-    const { consumer } = consumeResponse.json() as { consumer: { producerId: string; userId: string } };
+    const { consumer } = consumeResponse.json() as {
+      consumer: { id: string; producerId: string; userId: string; paused: boolean };
+    };
     expect(consumer.producerId).toBe(producer.id);
     expect(consumer.userId).toBe(admin.id);
+    expect(consumer.paused).toBe(true);
+
+    const resumeConsumerResponse = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/voice/consumers/${consumer.id}`,
+      cookies: {
+        current_session: 'voice_member_session',
+      },
+      payload: {
+        sessionId: memberJoin.sessionId,
+        paused: false,
+      },
+    });
+    expect(resumeConsumerResponse.statusCode).toBe(200);
+    expect((resumeConsumerResponse.json() as { consumer: { paused: boolean } }).consumer.paused).toBe(false);
+
+    const pauseConsumerResponse = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/voice/consumers/${consumer.id}`,
+      cookies: {
+        current_session: 'voice_member_session',
+      },
+      payload: {
+        sessionId: memberJoin.sessionId,
+        paused: true,
+      },
+    });
+    expect(pauseConsumerResponse.statusCode).toBe(200);
+    expect((pauseConsumerResponse.json() as { consumer: { paused: boolean } }).consumer.paused).toBe(true);
 
     const otherJoinResponse = await app.inject({
       method: 'POST',

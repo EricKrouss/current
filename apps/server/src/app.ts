@@ -16,6 +16,7 @@ import { registerPresenceRoutes } from './api/routes/presence-routes.js';
 import { registerMetricsRoutes } from './api/routes/metrics-routes.js';
 import { registerAdminRoutes } from './api/routes/admin-routes.js';
 import { registerWebClientRoutes } from './web-client.js';
+import { isAllowedCorsOrigin, rejectDisallowedBrowserOrigin } from './api/origin-guard.js';
 
 export interface BuildAppOptions {
   webDistDir?: string | false;
@@ -40,7 +41,9 @@ export function buildApp(context: AppContext, options: BuildAppOptions = {}) {
   app.decorate('appContext', context);
 
   app.register(cors, {
-    origin: true,
+    origin: (origin, callback) => {
+      callback(null, origin && isAllowedCorsOrigin(origin, context.serverConfig.get()) ? origin : false);
+    },
     credentials: true,
   });
 
@@ -55,6 +58,7 @@ export function buildApp(context: AppContext, options: BuildAppOptions = {}) {
     },
   });
 
+  app.addHook('onRequest', rejectDisallowedBrowserOrigin);
   app.addHook('onRequest', attachCurrentUser);
 
   app.addHook('onResponse', async (_request, reply) => {

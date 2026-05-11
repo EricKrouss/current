@@ -284,6 +284,7 @@ const PERMISSIONS: Permission[] = [
   'MANAGE_ROLES',
   'MODERATE_MEMBERS',
   'MANAGE_MESSAGES',
+  'VIEW_CHANNEL',
   'SEND_MESSAGES',
   'CONNECT_VOICE',
   'SPEAK_VOICE',
@@ -1268,7 +1269,7 @@ export function ServerSettingsModal({
         name: 'New Role',
         color: '#6bd7ff',
         position: roles[0] ? roles[0].position + 1 : 1,
-        permissions: ['SEND_MESSAGES', 'CONNECT_VOICE', 'SPEAK_VOICE'] satisfies Permission[],
+        permissions: ['VIEW_CHANNEL', 'SEND_MESSAGES', 'CONNECT_VOICE', 'SPEAK_VOICE'] satisfies Permission[],
       }),
     onSuccess: async (role) => {
       setSelectedRoleId(role.id);
@@ -2450,7 +2451,7 @@ export function ServerSettingsModal({
             <label>{renderFieldLabel('Announced IP', 'rtc.announcedIp')}<input value={draft.rtc.announcedIp} onChange={(event) => updateDraft('rtc', { announcedIp: event.target.value })} /></label>
             <label>{renderFieldLabel('UDP min', 'rtc.udpMinPort')}<input type="number" value={draft.rtc.udpMinPort} onChange={(event) => updateDraft('rtc', { udpMinPort: Number(event.target.value) })} /></label>
             <label>{renderFieldLabel('UDP max', 'rtc.udpMaxPort')}<input type="number" value={draft.rtc.udpMaxPort} onChange={(event) => updateDraft('rtc', { udpMaxPort: Number(event.target.value) })} /></label>
-            <label>{renderFieldLabel('SFU workers', 'rtc.workerCount')}<input type="number" min="1" max="8" value={draft.rtc.workerCount} onChange={(event) => updateDraft('rtc', { workerCount: Number(event.target.value) })} /></label>
+            <label>{renderFieldLabel('SFU workers', 'rtc.workerCount')}<input type="number" min="0" max="8" value={draft.rtc.workerCount} onChange={(event) => updateDraft('rtc', { workerCount: Number(event.target.value) })} /></label>
             <label>{renderFieldLabel('Session timeout ms', 'rtc.sessionTimeoutMs')}<input type="number" min="5000" value={draft.rtc.sessionTimeoutMs} onChange={(event) => updateDraft('rtc', { sessionTimeoutMs: Number(event.target.value) })} /></label>
           </div>
           <label>{renderFieldLabel('TURN URLs', 'rtc.turnUrls')}<textarea value={draft.rtc.turnUrlsText} onChange={(event) => updateDraft('rtc', { turnUrlsText: event.target.value })} /></label>

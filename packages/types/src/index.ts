@@ -1,6 +1,14 @@
 export type ISODate = string;
 
 export type RegistrationMode = 'invite_only' | 'open_signup' | 'manual_approval';
+export type ServerAccessRequestStatus = 'pending' | 'approved' | 'denied';
+export type ServerAccessRequestSource = 'browser' | 'gaia_launcher' | 'unknown';
+export type ServerAccessState =
+  | 'approved'
+  | 'pending'
+  | 'denied'
+  | 'not_requested'
+  | 'invite_required';
 
 export interface PageInfo {
   hasMore: boolean;
@@ -18,6 +26,7 @@ export interface CurrentUser {
   handle: string;
   displayName: string;
   avatarUrl?: string;
+  bio?: string;
   roleIds: string[];
   createdAt: ISODate;
 }
@@ -56,6 +65,44 @@ export interface CurrentServer {
   createdAt: ISODate;
 }
 
+export interface ServerAccessRequestUser {
+  id: string;
+  did: string;
+  handle: string;
+  displayName: string;
+  avatarUrl?: string;
+  bio?: string;
+}
+
+export interface ServerAccessRequest {
+  id: string;
+  serverId: string;
+  userId: string;
+  status: ServerAccessRequestStatus;
+  notificationsEnabled: boolean;
+  source: ServerAccessRequestSource;
+  requestedAt: ISODate;
+  updatedAt: ISODate;
+  reviewedBy?: string;
+  reviewedAt?: ISODate;
+  user?: ServerAccessRequestUser;
+}
+
+export interface ServerAccess {
+  state: ServerAccessState;
+  registrationMode: RegistrationMode;
+  request?: ServerAccessRequest;
+}
+
+export interface MessageAuthor {
+  id: string;
+  did: string;
+  handle: string;
+  displayName: string;
+  avatarUrl?: string;
+  bio?: string;
+}
+
 export type ChannelType = 'category' | 'text' | 'voice' | 'dm';
 
 export interface Channel {
@@ -82,6 +129,7 @@ export interface Message {
   id: string;
   channelId: string;
   authorId: string;
+  author?: MessageAuthor;
   content: string;
   encryptedContent?: EncryptedMessageContent;
   parentMessageId?: string;
@@ -101,6 +149,8 @@ export interface MessageReaction {
 
 export interface Attachment {
   id: string;
+  messageId?: string;
+  ownerUserId?: string;
   fileName: string;
   mimeType: string;
   byteSize: number;
@@ -123,6 +173,7 @@ export type Permission =
   | 'MANAGE_ROLES'
   | 'MODERATE_MEMBERS'
   | 'MANAGE_MESSAGES'
+  | 'VIEW_CHANNEL'
   | 'SEND_MESSAGES'
   | 'CONNECT_VOICE'
   | 'SPEAK_VOICE'

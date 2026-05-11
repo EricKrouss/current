@@ -5,9 +5,12 @@ describe('config schema', () => {
   it('creates a valid default config', () => {
     const config = createDefaultConfig({});
     expect(config.version).toBe(1);
+    expect(config.server.port).toBe(6414);
+    expect(config.server.publicUrl).toBe('http://localhost:6414');
     expect(config.server.registrationMode).toBe('invite_only');
     expect(config.server.tls.enabled).toBe(false);
     expect(config.auth.mode).toBe('atproto');
+    expect(config.auth.redirectUri).toBe('http://localhost:6414/api/v1/auth/oauth/callback');
     expect(config.auth.lanRedirectBaseUrl).toBe('');
     expect(config.media.gifProvider).toBe('klipy');
     expect(config.media.gifFallbackProvider).toBe('none');
@@ -16,6 +19,7 @@ describe('config schema', () => {
     expect(config.appearance.panelColor).toBe('');
     expect(config.appearance.ownMessageColor).toBe('');
     expect(config.appearance.otherMessageColor).toBe('');
+    expect(config.rtc.workerCount).toBe(0);
   });
 
   it('migrates unknown versions into v1', () => {

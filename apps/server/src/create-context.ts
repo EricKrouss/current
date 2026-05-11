@@ -30,7 +30,7 @@ export function createAppContext(input: {
   const invites = new InviteService(repos);
   const members = new MemberService(repos, () => serverConfig.get());
   const chat = new ChatService(repos, metrics, moderation, () => serverConfig.get());
-  const gateway = new GatewayService(repos, auth, metrics);
+  const gateway = new GatewayService(repos, auth, metrics, () => serverConfig.get());
   const voice = new VoiceService(
     repos,
     metrics,

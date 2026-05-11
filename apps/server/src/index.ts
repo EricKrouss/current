@@ -24,6 +24,66 @@ function buildLocalWebsiteUrl(config: CurrentConfig): string {
   return `${protocol}://${normalizeBrowserHost(config.server.host)}:${config.server.port}`;
 }
 
+function parsePortOverride(): number | null {
+  const candidate =
+    process.env.CURRENT_PORT?.trim() ||
+    process.env.CURRENT_SERVER_PORT?.trim() ||
+    process.env.PORT?.trim() ||
+    '';
+  if (!candidate) {
+    return null;
+  }
+
+  const port = Number(candidate);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid port override "${candidate}". Use a number from 1 to 65535.`);
+  }
+  return port;
+}
+
+function isLoopbackUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return (
+      parsed.hostname === 'localhost' ||
+      parsed.hostname === '::1' ||
+      parsed.hostname === '[::1]' ||
+      parsed.hostname.startsWith('127.')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function withPort(value: string, port: number): string {
+  const parsed = new URL(value);
+  parsed.port = String(port);
+  return parsed.toString();
+}
+
+function applyPortOverride(config: CurrentConfig, portOverride: number | null): CurrentConfig {
+  if (!portOverride) {
+    return config;
+  }
+
+  return createDefaultConfig({
+    ...config,
+    server: {
+      ...config.server,
+      port: portOverride,
+      publicUrl: isLoopbackUrl(config.server.publicUrl)
+        ? withPort(config.server.publicUrl, portOverride)
+        : config.server.publicUrl,
+    },
+    auth: {
+      ...config.auth,
+      redirectUri: isLoopbackUrl(config.auth.redirectUri)
+        ? withPort(config.auth.redirectUri, portOverride)
+        : config.auth.redirectUri,
+    },
+  });
+}
+
 function logWebsiteUrl(config: CurrentConfig, listenAddress: string): void {
   const publicUrl = config.server.publicUrl;
   const localUrl = buildLocalWebsiteUrl(config);
@@ -66,6 +126,7 @@ function createInitialConfig(): CurrentConfig {
 
 async function main() {
   const configPath = process.env.CURRENT_CONFIG_PATH ?? join(process.cwd(), 'config/current.config.json');
+  const portOverride = parsePortOverride();
 
   if (!configExists(configPath)) {
     mkdirSync(dirname(configPath), { recursive: true });
@@ -73,7 +134,7 @@ async function main() {
     saveConfig(configPath, defaultConfig);
   }
 
-  const config = loadConfig(configPath);
+  const config = applyPortOverride(loadConfig(configPath), portOverride);
   const db = createDb(config.storage.sqlitePath);
   const context = createAppContext({
     db,
@@ -92,6 +153,9 @@ async function main() {
   });
 
   logWebsiteUrl(config, listenAddress);
+  if (portOverride) {
+    console.log(`[server] Port override active: ${portOverride}`);
+  }
   app.log.info(`Current server running at ${config.server.publicUrl}`);
 
   const shutdown = async (signal: string) => {

@@ -11,6 +11,7 @@ interface UserRow {
   handle: string;
   display_name: string;
   avatar_url: string | null;
+  bio: string | null;
   selected_presence_status: string;
   created_at: string;
 }
@@ -33,6 +34,7 @@ export class UsersRepository extends BaseRepository {
     handle: string;
     displayName: string;
     avatarUrl?: string;
+    bio?: string;
   }): CurrentUser {
     const existing = this.db.prepare('SELECT id FROM users WHERE did = ?').get(input.did) as
       | { id: string }
@@ -44,16 +46,17 @@ export class UsersRepository extends BaseRepository {
     this.db
       .prepare(
         `
-      INSERT INTO users (id, did, handle, display_name, avatar_url, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO users (id, did, handle, display_name, avatar_url, bio, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(did) DO UPDATE SET
         handle = excluded.handle,
         display_name = excluded.display_name,
         avatar_url = excluded.avatar_url,
+        bio = excluded.bio,
         updated_at = excluded.updated_at
     `,
       )
-      .run(userId, input.did, input.handle, input.displayName, input.avatarUrl ?? null, ts, ts);
+      .run(userId, input.did, input.handle, input.displayName, input.avatarUrl ?? null, input.bio ?? null, ts, ts);
 
     return this.findById(userId)!;
   }
@@ -82,6 +85,7 @@ export class UsersRepository extends BaseRepository {
       handle: row.handle,
       displayName: row.display_name,
       avatarUrl: row.avatar_url ?? undefined,
+      bio: row.bio ?? undefined,
       roleIds: roleRows.map((entry) => entry.role_id),
       createdAt: row.created_at,
     };
@@ -148,7 +152,13 @@ export class UsersRepository extends BaseRepository {
           FROM moderation_actions AS mod
           WHERE mod.server_id = ?
             AND mod.target_user_id = users.id
-            AND mod.type IN ('ban', 'kick')
+            AND (
+              mod.type = 'ban'
+              OR (
+                mod.type = 'kick'
+                AND mod.created_at >= COALESCE(users.updated_at, users.created_at)
+              )
+            )
         )
       `,
       filterParams: [input.serverId],
@@ -306,6 +316,7 @@ export class UsersRepository extends BaseRepository {
           users.handle,
           users.display_name,
           users.avatar_url,
+          users.bio,
           users.selected_presence_status,
           users.created_at
         FROM users
@@ -377,6 +388,7 @@ export class UsersRepository extends BaseRepository {
       handle: row.handle,
       displayName: row.display_name,
       avatarUrl: row.avatar_url ?? undefined,
+      bio: row.bio ?? undefined,
       roleIds,
       createdAt: row.created_at,
     };

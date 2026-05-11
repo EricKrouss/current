@@ -29,13 +29,13 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
     "name": "Current Server",
     "slug": "current-server",
     "host": "0.0.0.0",
-    "port": 8080,
-    "publicUrl": "http://127.0.0.1:8080",
+    "port": 6414,
+    "publicUrl": "http://127.0.0.1:6414",
     "registrationMode": "invite_only"
   },
   "auth": {
     "atprotoClientId": "",
-    "redirectUri": "http://127.0.0.1:8080/api/v1/auth/oauth/callback",
+    "redirectUri": "http://127.0.0.1:6414/api/v1/auth/oauth/callback",
     "authorizationEndpoint": "https://bsky.social/oauth/authorize",
     "tokenEndpoint": "https://bsky.social/oauth/token",
     "profileEndpoint": "https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile",

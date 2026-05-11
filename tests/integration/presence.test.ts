@@ -93,4 +93,52 @@ describe('presence status integration', () => {
 
     await close();
   });
+
+  it('disconnects the logged-out gateway session so presence can go offline immediately', async () => {
+    const { app, context, close } = await createTestApp();
+
+    const loginResponse = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/dev-login',
+      payload: {
+        handle: 'presence.logout@current',
+        displayName: 'Presence Logout',
+      },
+    });
+
+    expect(loginResponse.statusCode).toBe(200);
+    const setCookie = loginResponse.headers['set-cookie'];
+    const rawCookie = Array.isArray(setCookie) ? setCookie[0] : setCookie;
+    const sessionToken = rawCookie?.match(/current_session=([^;]+)/)?.[1];
+    expect(sessionToken).toBeTruthy();
+    if (!sessionToken) {
+      throw new Error('Expected current_session cookie token');
+    }
+
+    const disconnectedSessions: Array<{ token: string; reason?: string }> = [];
+    const originalDisconnectSession = context.gateway.disconnectSession.bind(context.gateway);
+    context.gateway.disconnectSession = ((token: string, reason?: string) => {
+      disconnectedSessions.push({ token, reason });
+    }) as typeof context.gateway.disconnectSession;
+
+    const logoutResponse = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/logout',
+      cookies: {
+        current_session: sessionToken,
+      },
+    });
+
+    context.gateway.disconnectSession = originalDisconnectSession;
+
+    expect(logoutResponse.statusCode).toBe(204);
+    expect(disconnectedSessions).toEqual([
+      {
+        token: sessionToken,
+        reason: 'Logged out',
+      },
+    ]);
+
+    await close();
+  });
 });

@@ -15,6 +15,13 @@ interface ModerationActionRow {
   created_at: string;
 }
 
+export interface ServerRemovalStatus {
+  type: 'ban' | 'kick';
+  reason?: string;
+  actorId: string;
+  createdAt: string;
+}
+
 export class ModerationRepository extends BaseRepository {
   constructor(db: DatabaseSync) {
     super(db);
@@ -82,21 +89,63 @@ export class ModerationRepository extends BaseRepository {
   }
 
   isKicked(serverId: string, userId: string): boolean {
-    const row = this.db
+    return this.getServerRemovalStatus(serverId, userId)?.type === 'kick';
+  }
+
+  getServerRemovalStatus(serverId: string, userId: string): ServerRemovalStatus | null {
+    const ban = this.db
       .prepare(
         `
-      SELECT id
+      SELECT actor_id, reason, created_at
       FROM moderation_actions
       WHERE server_id = ?
       AND target_user_id = ?
-      AND type = 'kick'
+      AND type = 'ban'
       ORDER BY created_at DESC
       LIMIT 1
     `,
       )
-      .get(serverId, userId) as { id: string } | undefined;
+      .get(serverId, userId) as
+      | { actor_id: string; reason: string | null; created_at: string }
+      | undefined;
 
-    return Boolean(row);
+    if (ban) {
+      return {
+        type: 'ban',
+        reason: ban.reason ?? undefined,
+        actorId: ban.actor_id,
+        createdAt: ban.created_at,
+      };
+    }
+
+    const kick = this.db
+      .prepare(
+        `
+      SELECT mod.actor_id, mod.reason, mod.created_at
+      FROM moderation_actions AS mod
+      JOIN users ON users.id = mod.target_user_id
+      WHERE mod.server_id = ?
+      AND mod.target_user_id = ?
+      AND mod.type = 'kick'
+      AND mod.created_at >= COALESCE(users.updated_at, users.created_at)
+      ORDER BY mod.created_at DESC
+      LIMIT 1
+    `,
+      )
+      .get(serverId, userId) as
+      | { actor_id: string; reason: string | null; created_at: string }
+      | undefined;
+
+    if (!kick) {
+      return null;
+    }
+
+    return {
+      type: 'kick',
+      reason: kick.reason ?? undefined,
+      actorId: kick.actor_id,
+      createdAt: kick.created_at,
+    };
   }
 
   activeTimeoutUntil(serverId: string, userId: string): string | null {

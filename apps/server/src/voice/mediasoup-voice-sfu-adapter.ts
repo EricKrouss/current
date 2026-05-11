@@ -25,9 +25,13 @@ const OPUS_MEDIA_CODECS: mediasoupTypes.RouterRtpCodecCapability[] = [
     },
   },
 ];
+const AUTO_WORKER_COUNT = 0;
+const MAX_WORKER_COUNT = 8;
+const WORKER_IDLE_SHUTDOWN_MS = 90_000;
 
 interface VoiceRoom {
   channelId: string;
+  worker: mediasoupTypes.Worker;
   router: mediasoupTypes.Router;
   audioLevelObserver: mediasoupTypes.AudioLevelObserver;
   sessions: Set<string>;
@@ -63,7 +67,7 @@ export class MediasoupVoiceSfuAdapter implements VoiceSfuAdapter {
   private readonly sessionByUserId = new Map<string, string>();
   private readonly workers: mediasoupTypes.Worker[] = [];
   private workerInitPromise: Promise<void> | null = null;
-  private nextWorkerIndex = 0;
+  private workerIdleShutdownTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly options: VoiceSfuAdapterOptions) {}
 
@@ -262,12 +266,33 @@ export class MediasoupVoiceSfuAdapter implements VoiceSfuAdapter {
   }
 
   async resumeConsumer(input: { sessionId: string; consumerId: string }): Promise<void> {
-    const session = this.requireSession(input.sessionId);
-    const consumer = session.consumers.get(input.consumerId);
+    const consumer = await this.setConsumerPaused({
+      ...input,
+      paused: false,
+    });
     if (!consumer) {
       throw new Error('Voice consumer not found.');
     }
-    await consumer.resume();
+  }
+
+  async setConsumerPaused(input: {
+    sessionId: string;
+    consumerId: string;
+    paused: boolean;
+  }): Promise<VoiceConsumerInfo | null> {
+    const session = this.requireSession(input.sessionId);
+    const consumer = session.consumers.get(input.consumerId);
+    if (!consumer) {
+      return null;
+    }
+
+    if (input.paused) {
+      await consumer.pause();
+    } else {
+      await consumer.resume();
+    }
+
+    return this.serializeConsumer(session, consumer);
   }
 
   async closeSession(sessionId: string): Promise<VoiceSessionCloseResult | null> {
@@ -371,15 +396,19 @@ export class MediasoupVoiceSfuAdapter implements VoiceSfuAdapter {
     for (const room of this.rooms.values()) {
       producerCount += room.producers.size;
     }
+    const workerLoads = this.workers.map((worker, index) => this.describeWorkerLoad(worker, index));
     return {
       rooms: this.rooms.size,
       sessions: this.sessions.size,
       producers: producerCount,
       workerCount: this.workers.length,
+      workerLoads,
+      idleShutdownPending: this.workerIdleShutdownTimer !== null,
     };
   }
 
   async close(): Promise<void> {
+    this.clearWorkerIdleShutdownTimer();
     const sessions = [...this.sessions.keys()];
     for (const sessionId of sessions) {
       await this.closeSession(sessionId);
@@ -392,14 +421,14 @@ export class MediasoupVoiceSfuAdapter implements VoiceSfuAdapter {
   }
 
   private async getOrCreateRoom(channelId: string): Promise<VoiceRoom> {
+    this.clearWorkerIdleShutdownTimer();
     const existing = this.rooms.get(channelId);
     if (existing) {
       return existing;
     }
 
     await this.ensureWorkers();
-    const worker = this.workers[this.nextWorkerIndex % this.workers.length];
-    this.nextWorkerIndex += 1;
+    const worker = this.selectWorkerForRoom();
     const router = await worker.createRouter({
       mediaCodecs: OPUS_MEDIA_CODECS,
       appData: {
@@ -417,6 +446,7 @@ export class MediasoupVoiceSfuAdapter implements VoiceSfuAdapter {
 
     const room: VoiceRoom = {
       channelId,
+      worker,
       router,
       audioLevelObserver,
       sessions: new Set(),
@@ -466,8 +496,7 @@ export class MediasoupVoiceSfuAdapter implements VoiceSfuAdapter {
 
   private async createWorkers(): Promise<void> {
     const rtc = this.options.getConfig().rtc;
-    const fallbackCount = Math.min(2, Math.max(1, availableParallelism() - 1));
-    const workerCount = Math.min(Math.max(rtc.workerCount ?? fallbackCount, 1), 8);
+    const workerCount = this.resolveWorkerCount(rtc.workerCount);
 
     for (let index = 0; index < workerCount; index += 1) {
       const worker = await createWorker({
@@ -481,9 +510,72 @@ export class MediasoupVoiceSfuAdapter implements VoiceSfuAdapter {
         if (workerIndex >= 0) {
           this.workers.splice(workerIndex, 1);
         }
+        for (const [channelId, room] of this.rooms) {
+          if (room.worker === worker) {
+            room.audioLevelObserver.close();
+            room.router.close();
+            this.rooms.delete(channelId);
+          }
+        }
       });
       this.workers.push(worker);
     }
+  }
+
+  private resolveWorkerCount(configuredWorkerCount: number | undefined): number {
+    if (configuredWorkerCount && configuredWorkerCount > AUTO_WORKER_COUNT) {
+      return Math.min(Math.max(configuredWorkerCount, 1), MAX_WORKER_COUNT);
+    }
+    return Math.min(MAX_WORKER_COUNT, Math.max(1, availableParallelism() - 1));
+  }
+
+  private selectWorkerForRoom(): mediasoupTypes.Worker {
+    if (this.workers.length === 0) {
+      throw new Error('Voice workers are not ready.');
+    }
+    const [firstWorker] = this.workers;
+    if (!firstWorker) {
+      throw new Error('Voice workers are not ready.');
+    }
+    if (this.workers.length === 1) {
+      return firstWorker;
+    }
+
+    let selected = firstWorker;
+    let selectedLoad = this.scoreWorkerLoad(selected);
+    for (const worker of this.workers.slice(1)) {
+      const load = this.scoreWorkerLoad(worker);
+      if (load < selectedLoad) {
+        selected = worker;
+        selectedLoad = load;
+      }
+    }
+    return selected;
+  }
+
+  private describeWorkerLoad(worker: mediasoupTypes.Worker, index: number): {
+    index: number;
+    rooms: number;
+    sessions: number;
+    producers: number;
+  } {
+    let rooms = 0;
+    let sessions = 0;
+    let producers = 0;
+    for (const room of this.rooms.values()) {
+      if (room.worker !== worker) {
+        continue;
+      }
+      rooms += 1;
+      sessions += room.sessions.size;
+      producers += room.producers.size;
+    }
+    return { index, rooms, sessions, producers };
+  }
+
+  private scoreWorkerLoad(worker: mediasoupTypes.Worker): number {
+    const load = this.describeWorkerLoad(worker, -1);
+    return load.sessions * 4 + load.producers * 2 + load.rooms;
   }
 
   private serializeTransport(record: VoiceTransportRecord): VoiceTransportInfo {
@@ -493,6 +585,22 @@ export class MediasoupVoiceSfuAdapter implements VoiceSfuAdapter {
       iceParameters: record.transport.iceParameters,
       iceCandidates: record.transport.iceCandidates,
       dtlsParameters: record.transport.dtlsParameters,
+    };
+  }
+
+  private serializeConsumer(session: VoiceSession, consumer: mediasoupTypes.Consumer): VoiceConsumerInfo {
+    const room = this.rooms.get(session.channelId);
+    const producerRecord = room?.producers.get(consumer.producerId);
+    if (!producerRecord) {
+      throw new Error('Voice producer not found.');
+    }
+    return {
+      id: consumer.id,
+      producerId: consumer.producerId,
+      userId: producerRecord.summary.userId,
+      kind: 'audio',
+      rtpParameters: consumer.rtpParameters,
+      paused: consumer.paused,
     };
   }
 
@@ -535,6 +643,7 @@ export class MediasoupVoiceSfuAdapter implements VoiceSfuAdapter {
     if (notify) {
       this.options.events?.onProducerClosed?.(record.summary);
     }
+    this.maybeCloseRoom(room.channelId);
     return record.summary;
   }
 
@@ -565,6 +674,39 @@ export class MediasoupVoiceSfuAdapter implements VoiceSfuAdapter {
     room.audioLevelObserver.close();
     room.router.close();
     this.rooms.delete(channelId);
+    this.scheduleWorkerIdleShutdown();
+  }
+
+  private scheduleWorkerIdleShutdown(): void {
+    if (
+      this.workerIdleShutdownTimer ||
+      this.workers.length === 0 ||
+      this.rooms.size > 0 ||
+      this.sessions.size > 0
+    ) {
+      return;
+    }
+
+    this.workerIdleShutdownTimer = setTimeout(() => {
+      this.workerIdleShutdownTimer = null;
+      if (this.rooms.size > 0 || this.sessions.size > 0) {
+        return;
+      }
+      for (const worker of this.workers) {
+        worker.close();
+      }
+      this.workers.length = 0;
+      this.workerInitPromise = null;
+    }, WORKER_IDLE_SHUTDOWN_MS);
+    this.workerIdleShutdownTimer.unref?.();
+  }
+
+  private clearWorkerIdleShutdownTimer(): void {
+    if (!this.workerIdleShutdownTimer) {
+      return;
+    }
+    clearTimeout(this.workerIdleShutdownTimer);
+    this.workerIdleShutdownTimer = null;
   }
 
   private buildIceServers(): RTCIceServer[] {

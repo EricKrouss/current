@@ -3,6 +3,34 @@ import { createTestApp } from '../helpers/test-app.js';
 import { addHours, nowIso } from '../../apps/server/src/utils/time.js';
 
 describe('setup owner assignment', () => {
+  it('rejects unauthenticated first-run setup from remote clients', async () => {
+    const { app, close } = await createTestApp();
+
+    const bootstrapResponse = await app.inject({
+      method: 'POST',
+      url: '/api/v1/setup/bootstrap',
+      remoteAddress: '10.22.33.44',
+      payload: {
+        serverName: 'Remote Setup',
+        slug: 'remote-setup',
+        publicUrl: 'http://127.0.0.1:8080',
+        registrationMode: 'invite_only',
+        adminDid: 'did:plc:remote-takeover',
+        adminHandle: 'remote-takeover.bsky.social',
+        adminDisplayName: 'Remote Takeover',
+      },
+    });
+
+    expect(bootstrapResponse.statusCode).toBe(401);
+    expect(bootstrapResponse.json()).toMatchObject({
+      error: {
+        code: 'SETUP_AUTH_REQUIRED',
+      },
+    });
+
+    await close();
+  });
+
   it('applies onboarding preferences and returns the default landing channel', async () => {
     const { app, db, context, close } = await createTestApp();
 
@@ -79,10 +107,19 @@ describe('setup owner assignment', () => {
 
     db.prepare(
       `
-      INSERT INTO users (id, did, handle, display_name, avatar_url, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO users (id, did, handle, display_name, avatar_url, bio, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `,
-    ).run('usr_owner_claim', 'did:plc:ownerclaim', 'ownerclaim.bsky.social', 'Owner Claim', null, nowIso(), nowIso());
+    ).run(
+      'usr_owner_claim',
+      'did:plc:ownerclaim',
+      'ownerclaim.bsky.social',
+      'Owner Claim',
+      'https://example.com/avatar.png',
+      'Ready to claim ownership.',
+      nowIso(),
+      nowIso(),
+    );
 
     db.prepare(
       `

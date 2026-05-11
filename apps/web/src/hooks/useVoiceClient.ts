@@ -41,6 +41,7 @@ interface VoiceConsumerInfo {
   userId: string;
   kind: 'audio';
   rtpParameters: mediasoupClientTypes.RtpParameters;
+  paused: boolean;
 }
 
 interface VoiceProducerResponse {
@@ -48,6 +49,10 @@ interface VoiceProducerResponse {
 }
 
 interface VoiceConsumerResponse {
+  consumer: VoiceConsumerInfo;
+}
+
+interface VoiceConsumerPatchResponse {
   consumer: VoiceConsumerInfo;
 }
 
@@ -73,6 +78,13 @@ export interface VoiceNetworkDiagnostics {
   recovering: boolean;
 }
 
+export interface VoiceAudioSettings {
+  inputDeviceId: string;
+  noiseSuppression: boolean;
+  echoCancellation: boolean;
+  autoGainControl: boolean;
+}
+
 interface VoiceSessionRef {
   sessionId: string;
   channelId: string;
@@ -93,6 +105,13 @@ const DEFAULT_VOICE_DIAGNOSTICS: VoiceNetworkDiagnostics = {
   recovering: false,
 };
 
+const DEFAULT_VOICE_AUDIO_SETTINGS: VoiceAudioSettings = {
+  inputDeviceId: 'default',
+  noiseSuppression: true,
+  echoCancellation: true,
+  autoGainControl: true,
+};
+
 function canUseMicrophoneOnThisOrigin(): boolean {
   if (window.isSecureContext) {
     return true;
@@ -108,6 +127,30 @@ function isPermissionDenied(error: unknown): boolean {
     error.name === 'PermissionDeniedError' ||
     error.name === 'SecurityError'
   );
+}
+
+function isAudioDeviceSelectionError(error: unknown): boolean {
+  return error instanceof DOMException && (
+    error.name === 'NotFoundError' ||
+    error.name === 'OverconstrainedError' ||
+    error.name === 'DevicesNotFoundError' ||
+    error.name === 'ConstraintNotSatisfiedError'
+  );
+}
+
+function createAudioConstraints(settings: VoiceAudioSettings, includeDevice: boolean): MediaTrackConstraints {
+  const constraints: MediaTrackConstraints = {
+    autoGainControl: settings.autoGainControl,
+    echoCancellation: settings.echoCancellation,
+    noiseSuppression: settings.noiseSuppression,
+    channelCount: 1,
+  };
+
+  if (includeDevice && settings.inputDeviceId && settings.inputDeviceId !== 'default') {
+    constraints.deviceId = { exact: settings.inputDeviceId };
+  }
+
+  return constraints;
 }
 
 function readNumber(value: unknown): number | undefined {
@@ -194,12 +237,19 @@ function collectTransportDiagnostics(report: RTCStatsReport): Partial<VoiceNetwo
   };
 }
 
-export function useVoiceClient({ currentUserId }: { currentUserId?: string }) {
+export function useVoiceClient({
+  currentUserId,
+  audioSettings = DEFAULT_VOICE_AUDIO_SETTINGS,
+}: {
+  currentUserId?: string;
+  audioSettings?: VoiceAudioSettings;
+}) {
   const [status, setStatus] = useState<VoiceConnectionStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<VoiceRemoteStream[]>([]);
   const [inputLevel, setInputLevel] = useState(0);
   const [diagnostics, setDiagnostics] = useState<VoiceNetworkDiagnostics>(DEFAULT_VOICE_DIAGNOSTICS);
+  const audioSettingsRef = useRef<VoiceAudioSettings>(audioSettings);
   const sessionRef = useRef<VoiceSessionRef | null>(null);
   const deviceRef = useRef<MediasoupDevice | null>(null);
   const sendTransportRef = useRef<MediasoupTransport | null>(null);
@@ -209,6 +259,7 @@ export function useVoiceClient({ currentUserId }: { currentUserId?: string }) {
   const localProducerTrackRef = useRef<MediaStreamTrack | null>(null);
   const localProducerPausedRef = useRef<boolean | null>(null);
   const remoteConsumersRef = useRef<Map<string, { userId: string; stream: MediaStream; consumer: MediasoupConsumer }>>(new Map());
+  const outputEnabledRef = useRef(true);
   const heartbeatTimerRef = useRef<number | null>(null);
   const diagnosticsTimerRef = useRef<number | null>(null);
   const recoveryTimersRef = useRef<Map<string, number>>(new Map());
@@ -226,6 +277,10 @@ export function useVoiceClient({ currentUserId }: { currentUserId?: string }) {
   const inputLevelRef = useRef(0);
   const inputLevelEmitRef = useRef(0);
   const joinGenerationRef = useRef(0);
+
+  useEffect(() => {
+    audioSettingsRef.current = audioSettings;
+  }, [audioSettings]);
 
   const clearHeartbeat = useCallback(() => {
     if (heartbeatTimerRef.current !== null) {
@@ -509,6 +564,27 @@ export function useVoiceClient({ currentUserId }: { currentUserId?: string }) {
     refreshRemoteStreams();
   }, [refreshRemoteStreams]);
 
+  const setRemoteConsumerPaused = useCallback((
+    entry: { consumer: MediasoupConsumer; stream: MediaStream },
+    paused: boolean,
+  ) => {
+    const session = sessionRef.current;
+    const track = entry.consumer.track;
+    track.enabled = !paused;
+    if (paused) {
+      entry.consumer.pause();
+    } else {
+      entry.consumer.resume();
+    }
+    if (!session) {
+      return;
+    }
+    void apiPatch<VoiceConsumerPatchResponse>(`/api/v1/voice/consumers/${entry.consumer.id}`, {
+      sessionId: session.sessionId,
+      paused,
+    }).catch(() => undefined);
+  }, []);
+
   const cleanupLocal = useCallback((stopMicrophone: boolean) => {
     clearHeartbeat();
     clearDiagnosticsTimer();
@@ -536,6 +612,7 @@ export function useVoiceClient({ currentUserId }: { currentUserId?: string }) {
     sessionRef.current = null;
     transportStatesRef.current = { send: 'idle', recv: 'idle' };
     iceRestartCountRef.current = 0;
+    outputEnabledRef.current = true;
     setDiagnostics(DEFAULT_VOICE_DIAGNOSTICS);
     setRemoteStreams([]);
   }, [clearDiagnosticsTimer, clearHeartbeat, clearRecoveryTimers, removeRemoteProducer, stopInputMeter]);
@@ -611,15 +688,22 @@ export function useVoiceClient({ currentUserId }: { currentUserId?: string }) {
       rtpParameters: consumerOptions.rtpParameters,
     });
     const stream = new MediaStream([consumer.track]);
-    remoteConsumersRef.current.set(producer.id, {
+    const entry = {
       userId: consumerOptions.userId,
       stream,
       consumer,
-    });
+    };
+    if (!outputEnabledRef.current) {
+      consumer.track.enabled = false;
+      consumer.pause();
+    }
+    remoteConsumersRef.current.set(producer.id, entry);
     refreshRemoteStreams();
-    await apiPost<void>(`/api/v1/voice/consumers/${consumer.id}/resume`, {
-      sessionId: session.sessionId,
-    });
+    if (outputEnabledRef.current) {
+      await apiPost<void>(`/api/v1/voice/consumers/${consumer.id}/resume`, {
+        sessionId: session.sessionId,
+      });
+    }
   }, [currentUserId, ensureRecvTransport, refreshRemoteStreams]);
 
   const setInputEnabled = useCallback((enabled: boolean) => {
@@ -641,6 +725,16 @@ export function useVoiceClient({ currentUserId }: { currentUserId?: string }) {
     }).catch(() => undefined);
   }, []);
 
+  const setOutputEnabled = useCallback((enabled: boolean) => {
+    if (outputEnabledRef.current === enabled) {
+      return;
+    }
+    outputEnabledRef.current = enabled;
+    for (const entry of remoteConsumersRef.current.values()) {
+      setRemoteConsumerPaused(entry, !enabled);
+    }
+  }, [setRemoteConsumerPaused]);
+
   const join = useCallback(async (
     channelId: string,
     input: Pick<VoiceState, 'muted' | 'deafened' | 'pushToTalk'>,
@@ -648,6 +742,7 @@ export function useVoiceClient({ currentUserId }: { currentUserId?: string }) {
     joinGenerationRef.current += 1;
     const generation = joinGenerationRef.current;
     cleanupLocal(true);
+    outputEnabledRef.current = !input.deafened;
     setError(null);
 
     if (!canUseMicrophoneOnThisOrigin()) {
@@ -657,15 +752,22 @@ export function useVoiceClient({ currentUserId }: { currentUserId?: string }) {
 
     try {
       setStatus('requesting_microphone');
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          autoGainControl: true,
-          echoCancellation: true,
-          noiseSuppression: true,
-          channelCount: 1,
-        },
-        video: false,
-      });
+      const selectedAudioSettings = audioSettingsRef.current;
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: createAudioConstraints(selectedAudioSettings, true),
+          video: false,
+        });
+      } catch (error) {
+        if (selectedAudioSettings.inputDeviceId === 'default' || !isAudioDeviceSelectionError(error)) {
+          throw error;
+        }
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: createAudioConstraints(selectedAudioSettings, false),
+          video: false,
+        });
+      }
       if (generation !== joinGenerationRef.current) {
         for (const track of stream.getTracks()) {
           track.stop();
@@ -789,6 +891,7 @@ export function useVoiceClient({ currentUserId }: { currentUserId?: string }) {
     join,
     leave,
     setInputEnabled,
+    setOutputEnabled,
     handleGatewayEvent,
   };
 }

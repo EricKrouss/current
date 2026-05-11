@@ -2,6 +2,8 @@ import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 
+export const DEFAULT_SERVER_PORT = 6414;
+
 const PanelColorSchema = z
   .string()
   .transform((value) => normalizePanelColor(value))
@@ -13,7 +15,7 @@ const CurrentConfigSchema = z.object({
     name: z.string().min(1),
     slug: z.string().min(1),
     host: z.string().default('0.0.0.0'),
-    port: z.number().int().positive().default(8080),
+    port: z.number().int().positive().default(DEFAULT_SERVER_PORT),
     publicUrl: z.string().url(),
     registrationMode: z.enum(['invite_only', 'open_signup', 'manual_approval']).default('invite_only'),
     tls: z
@@ -84,7 +86,7 @@ const CurrentConfigSchema = z.object({
     announcedIp: z.string().default('127.0.0.1'),
     udpMinPort: z.number().int().positive().default(40000),
     udpMaxPort: z.number().int().positive().default(40100),
-    workerCount: z.number().int().positive().max(8).default(1),
+    workerCount: z.number().int().min(0).max(8).default(0),
     sessionTimeoutMs: z.number().int().positive().default(45_000),
     turnUrls: z.array(z.string()).default([]),
     turnUsername: z.string().optional(),
@@ -213,8 +215,8 @@ export function createDefaultConfig(partial: DeepPartial<CurrentConfig> = {}): C
       name: partial.server?.name ?? 'Current Server',
       slug: partial.server?.slug ?? 'current-server',
       host: partial.server?.host ?? '0.0.0.0',
-      port: partial.server?.port ?? 8080,
-      publicUrl: partial.server?.publicUrl ?? 'http://localhost:8080',
+      port: partial.server?.port ?? DEFAULT_SERVER_PORT,
+      publicUrl: partial.server?.publicUrl ?? `http://localhost:${DEFAULT_SERVER_PORT}`,
       registrationMode: partial.server?.registrationMode ?? 'invite_only',
       tls: {
         enabled: partial.server?.tls?.enabled ?? false,
@@ -225,7 +227,8 @@ export function createDefaultConfig(partial: DeepPartial<CurrentConfig> = {}): C
     auth: {
       mode: partial.auth?.mode ?? 'atproto',
       atprotoClientId: partial.auth?.atprotoClientId ?? '',
-      redirectUri: partial.auth?.redirectUri ?? 'http://localhost:8080/api/v1/auth/oauth/callback',
+      redirectUri:
+        partial.auth?.redirectUri ?? `http://localhost:${DEFAULT_SERVER_PORT}/api/v1/auth/oauth/callback`,
       lanRedirectBaseUrl: partial.auth?.lanRedirectBaseUrl ?? '',
       authorizationEndpoint:
         partial.auth?.authorizationEndpoint ?? 'https://bsky.social/oauth/authorize',
@@ -265,7 +268,7 @@ export function createDefaultConfig(partial: DeepPartial<CurrentConfig> = {}): C
       announcedIp: partial.rtc?.announcedIp ?? '127.0.0.1',
       udpMinPort: partial.rtc?.udpMinPort ?? 40000,
       udpMaxPort: partial.rtc?.udpMaxPort ?? 40100,
-      workerCount: partial.rtc?.workerCount ?? 1,
+      workerCount: partial.rtc?.workerCount ?? 0,
       sessionTimeoutMs: partial.rtc?.sessionTimeoutMs ?? 45_000,
       turnUrls: partial.rtc?.turnUrls ?? [],
       turnUsername: partial.rtc?.turnUsername,

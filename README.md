@@ -52,7 +52,7 @@ It will ask for a launch mode:
 
 If the configured port is already in use, the launcher will stop before building and offer to open the existing server or retry after you close the other process.
 
-Open `http://127.0.0.1:8080` for the standard instance, or `http://127.0.0.1:8081` for the LAN instance.
+Open `http://127.0.0.1:6414` for the standard instance, or `http://127.0.0.1:8081` for the LAN instance.
 
 Manual equivalent:
 
@@ -63,6 +63,14 @@ pnpm launch:server:normal
 pnpm launch:server:dev
 # or
 pnpm launch:server:lan:normal
+```
+
+To use a different port for one launch, pass `--port` or set `CURRENT_PORT`:
+
+```bash
+pnpm launch:server:normal -- --port 7000
+pnpm dev -- --port 7000
+CURRENT_PORT=7000 ./Current\ Server\ Linux.sh
 ```
 
 The server dev launcher builds and watches the web GUI, then serves it from the API server.
@@ -95,6 +103,7 @@ Server config is loaded from:
 - `config/current.config.json`
 
 On first run, a default config file is generated automatically.
+For a persistent port change, edit `server.port`, `server.publicUrl`, and `auth.redirectUri` in that config file.
 
 OAuth defaults to atproto loopback mode (no custom `atprotoClientId` required).
 Use a `127.0.0.1` callback URL for local testing.

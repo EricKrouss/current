@@ -2,8 +2,34 @@ export interface ApiError {
   error?: {
     code?: string;
     message?: string;
+    reason?: string;
+    type?: string;
     reasons?: string[];
   };
+}
+
+export class ApiRequestError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly reason?: string;
+  readonly type?: string;
+  readonly reasons?: string[];
+
+  constructor(message: string, input: {
+    status: number;
+    code?: string;
+    reason?: string;
+    type?: string;
+    reasons?: string[];
+  }) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.status = input.status;
+    this.code = input.code;
+    this.reason = input.reason;
+    this.type = input.type;
+    this.reasons = input.reasons;
+  }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -30,7 +56,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       payload && typeof payload.error === 'string'
         ? payload.error
         : payload?.error?.message ?? `Request failed with ${response.status}`;
-    throw new Error(message);
+    throw new ApiRequestError(message, {
+      status: response.status,
+      code: typeof payload?.error === 'object' ? payload.error.code : undefined,
+      reason: typeof payload?.error === 'object' ? payload.error.reason : undefined,
+      type: typeof payload?.error === 'object' ? payload.error.type : undefined,
+      reasons: typeof payload?.error === 'object' ? payload.error.reasons : undefined,
+    });
   }
 
   if (response.status === 204) {
@@ -69,11 +101,12 @@ export async function apiDelete<T>(path: string): Promise<T> {
   return request<T>(path, { method: 'DELETE' });
 }
 
-export async function uploadAttachment(file: File) {
+export async function uploadAttachment(file: File, channelId?: string) {
   const form = new FormData();
   form.append('file', file, file.name);
+  const params = channelId ? `?${new URLSearchParams({ channelId }).toString()}` : '';
 
-  const response = await fetch('/api/v1/media/attachments', {
+  const response = await fetch(`/api/v1/media/attachments${params}`, {
     method: 'POST',
     credentials: 'include',
     body: form,

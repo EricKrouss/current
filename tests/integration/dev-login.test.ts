@@ -59,4 +59,27 @@ describe('dev login integration', () => {
 
     await close();
   });
+
+  it('rejects local dev login from remote clients', async () => {
+    const { app, close } = await createTestApp();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/dev-login',
+      remoteAddress: '10.22.33.44',
+      payload: {
+        handle: 'remote.tester@current',
+        displayName: 'Remote Tester',
+      },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: 'DEV_LOGIN_HOST_ONLY',
+      },
+    });
+
+    await close();
+  });
 });

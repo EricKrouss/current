@@ -181,6 +181,14 @@ export class VoiceService {
     await this.sfu.resumeConsumer(input);
   }
 
+  async setConsumerPaused(input: {
+    sessionId: string;
+    consumerId: string;
+    paused: boolean;
+  }): Promise<VoiceConsumerInfo | null> {
+    return this.sfu.setConsumerPaused(input);
+  }
+
   async setProducerPaused(input: {
     sessionId: string;
     producerId: string;
@@ -251,6 +259,10 @@ export class VoiceService {
         max: config.rtc.udpMaxPort,
       },
       workerCount: config.rtc.workerCount,
+      activeWorkers: sfu.workerCount,
+      workerMode: config.rtc.workerCount === 0 ? 'auto' : 'fixed',
+      workerLoads: sfu.workerLoads ?? [],
+      voiceWorkerIdleShutdownPending: Boolean(sfu.idleShutdownPending),
       activeRooms: sfu.rooms,
       activeSessions: sfu.sessions,
       activeProducers: sfu.producers,

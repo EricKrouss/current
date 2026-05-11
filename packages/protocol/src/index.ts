@@ -1,4 +1,4 @@
-import type { Message, UserPresence, VoiceProducer, VoiceState } from '@current/types';
+import type { CurrentUser, Message, UserPresence, VoiceProducer, VoiceState } from '@current/types';
 
 export type ClientEventType =
   | 'ACK'
@@ -25,6 +25,7 @@ export type ServerEventType =
   | 'VOICE_PRODUCER_REMOVED'
   | 'VOICE_SPEAKING'
   | 'SERVER_UPDATE'
+  | 'MEMBER_UPDATE'
   | 'MOD_ACTION'
   | 'ERROR';
 
@@ -44,6 +45,10 @@ export interface ReadyPayload {
 
 export interface MessageCreatePayload {
   message: Message;
+  notification?: {
+    mentionHandles?: string[];
+    replyToUserId?: string;
+  };
 }
 
 export interface MessageUpdatePayload {
@@ -97,6 +102,14 @@ export interface ServerUpdatePayload {
   server: unknown;
 }
 
+export interface MemberUpdatePayload {
+  action: 'join' | 'leave' | 'kick' | 'ban' | 'role_update';
+  userId: string;
+  member?: CurrentUser;
+  actorId?: string;
+  reason?: string;
+}
+
 export interface ErrorPayload {
   code: string;
   message: string;
@@ -120,6 +133,7 @@ export const GatewayEvents = {
   VOICE_PRODUCER_REMOVED: 'VOICE_PRODUCER_REMOVED',
   VOICE_SPEAKING: 'VOICE_SPEAKING',
   SERVER_UPDATE: 'SERVER_UPDATE',
+  MEMBER_UPDATE: 'MEMBER_UPDATE',
   MOD_ACTION: 'MOD_ACTION',
   ERROR: 'ERROR',
 } as const;

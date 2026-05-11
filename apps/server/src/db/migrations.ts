@@ -24,6 +24,7 @@ export function runMigrations(db: DatabaseSync): void {
       handle TEXT NOT NULL,
       display_name TEXT NOT NULL,
       avatar_url TEXT,
+      bio TEXT,
       selected_presence_status TEXT NOT NULL DEFAULT 'online',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -145,6 +146,23 @@ export function runMigrations(db: DatabaseSync): void {
       FOREIGN KEY (created_by) REFERENCES users(id)
     );
 
+    CREATE TABLE IF NOT EXISTS access_requests (
+      id TEXT PRIMARY KEY,
+      server_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      notifications_enabled INTEGER NOT NULL DEFAULT 0,
+      source TEXT NOT NULL DEFAULT 'browser',
+      requested_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      reviewed_by TEXT,
+      reviewed_at TEXT,
+      UNIQUE(server_id, user_id),
+      FOREIGN KEY (server_id) REFERENCES servers(id),
+      FOREIGN KEY (user_id) REFERENCES users(id),
+      FOREIGN KEY (reviewed_by) REFERENCES users(id)
+    );
+
     CREATE TABLE IF NOT EXISTS automod_rules (
       id TEXT PRIMARY KEY,
       server_id TEXT NOT NULL,
@@ -218,6 +236,8 @@ export function runMigrations(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_gateway_events_seq ON gateway_events(seq);
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_user_ip_address ON user_ip_activity(ip_address, last_seen_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_access_requests_server_status_requested
+      ON access_requests(server_id, status, requested_at DESC);
   `);
 
   db.exec(`
@@ -270,7 +290,30 @@ export function runMigrations(db: DatabaseSync): void {
   }
 
   const userColumns = db.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>;
+  if (!userColumns.some((column) => column.name === 'bio')) {
+    db.exec('ALTER TABLE users ADD COLUMN bio TEXT;');
+  }
   if (!userColumns.some((column) => column.name === 'selected_presence_status')) {
     db.exec("ALTER TABLE users ADD COLUMN selected_presence_status TEXT NOT NULL DEFAULT 'online';");
+  }
+
+  const attachmentColumns = db.prepare('PRAGMA table_info(attachments)').all() as Array<{ name: string }>;
+  if (!attachmentColumns.some((column) => column.name === 'owner_user_id')) {
+    db.exec('ALTER TABLE attachments ADD COLUMN owner_user_id TEXT;');
+  }
+
+  const roles = db.prepare('SELECT id, permissions FROM roles').all() as Array<{ id: string; permissions: string }>;
+  const updateRolePermissions = db.prepare('UPDATE roles SET permissions = ? WHERE id = ?');
+  for (const role of roles) {
+    let permissions: unknown;
+    try {
+      permissions = JSON.parse(role.permissions);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(permissions) || permissions.includes('VIEW_CHANNEL')) {
+      continue;
+    }
+    updateRolePermissions.run(JSON.stringify(['VIEW_CHANNEL', ...permissions]), role.id);
   }
 }

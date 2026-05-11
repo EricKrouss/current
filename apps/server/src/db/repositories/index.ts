@@ -1,4 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { AccessRequestsRepository } from './access-requests-repository.js';
 import { AuditRepository } from './audit-repository.js';
 import { AutomodRepository } from './automod-repository.js';
 import { ChannelsRepository } from './channels-repository.js';
@@ -22,6 +23,7 @@ export interface RepositoryBag {
   channels: ChannelsRepository;
   messages: MessagesRepository;
   invites: InvitesRepository;
+  accessRequests: AccessRequestsRepository;
   automod: AutomodRepository;
   moderation: ModerationRepository;
   audit: AuditRepository;
@@ -39,6 +41,7 @@ export function createRepositories(db: DatabaseSync): RepositoryBag {
     channels: new ChannelsRepository(db),
     messages: new MessagesRepository(db),
     invites: new InvitesRepository(db),
+    accessRequests: new AccessRequestsRepository(db),
     automod: new AutomodRepository(db),
     moderation: new ModerationRepository(db),
     audit: new AuditRepository(db),

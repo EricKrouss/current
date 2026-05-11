@@ -162,6 +162,11 @@ describe('E2EE chat messages', () => {
       VALUES (?, ?, ?, ?)
     `,
     ).run('shared_member_session', 'usr_shared_member', addHours(1), nowIso());
+    const memberRole = db
+      .prepare('SELECT id FROM roles WHERE name = ?')
+      .get('Member') as { id: string } | undefined;
+    expect(memberRole?.id).toBeTruthy();
+    db.prepare('INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)').run('usr_shared_member', memberRole!.id);
 
     const unauthenticated = await app.inject({
       method: 'GET',

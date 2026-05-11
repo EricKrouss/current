@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { lookup as lookupMime } from 'mime-types';
 import type { Attachment, Channel, ChannelType, EncryptedMessageContent, Message, PageResponse } from '@current/types';
 import type { RepositoryBag } from '../db/repositories/index.js';
@@ -31,6 +31,21 @@ type GifSearchResponse = {
   providerError?: GifProviderError;
   providerErrors?: GifProviderError[];
 };
+
+const MAX_ATTACHMENTS_PER_MESSAGE = 10;
+const MAX_PENDING_ATTACHMENTS_PER_USER = 20;
+const MIN_PENDING_ATTACHMENT_BYTES_PER_USER = 64 * 1024 * 1024;
+const BLOCKED_ATTACHMENT_MIME_TYPES = new Set([
+  'application/xhtml+xml',
+  'image/svg+xml',
+  'text/html',
+  'text/xml',
+]);
+
+function isPathInsideDirectory(parent: string, child: string): boolean {
+  const relativePath = relative(resolve(parent), resolve(child));
+  return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
+}
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'GIF search failed.';
@@ -191,7 +206,12 @@ export class ChatService {
     return channel;
   }
 
-  deleteChannel(input: { channelId: string; serverId: string; actorId: string }): void {
+  deleteChannel(input: { channelId: string; serverId: string; actorId: string }): boolean {
+    const existing = this.repos.channels.findById(input.channelId);
+    if (!existing || existing.serverId !== input.serverId) {
+      return false;
+    }
+
     this.repos.channels.delete(input.channelId);
     this.repos.audit.create({
       serverId: input.serverId,
@@ -201,6 +221,7 @@ export class ChatService {
       targetId: input.channelId,
       payload: {},
     });
+    return true;
   }
 
   reorderChannels(input: {
@@ -283,6 +304,7 @@ export class ChatService {
     limit: number;
     authorId?: string;
     channelId?: string;
+    channelIds?: string[];
     identityMode?: 'all' | 'lan' | 'atproto';
   }): Message[] {
     return this.repos.messages.searchInServer(input);
@@ -301,6 +323,10 @@ export class ChatService {
     const channel = this.repos.channels.findById(input.channelId);
     if (!channel) {
       throw new Error('Channel not found.');
+    }
+
+    if (channel.serverId !== input.serverId) {
+      return { blocked: ['channel_not_found'] };
     }
 
     if (channel.type !== 'text' && channel.type !== 'dm') {
@@ -353,14 +379,12 @@ export class ChatService {
     }
 
     const attachments: Attachment[] = [];
-    for (const attachmentId of input.attachmentIds ?? []) {
-      const attachment = this.repos.messages
-        .recordUploadedAttachment({
-          fileName: 'placeholder',
-          mimeType: 'application/octet-stream',
-          byteSize: 0,
-          path: attachmentId,
-        });
+    const attachmentIds = [...new Set(input.attachmentIds ?? [])].slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
+    for (const attachmentId of attachmentIds) {
+      const attachment = this.getPendingAttachment(attachmentId, input.authorId);
+      if (!attachment) {
+        return { blocked: ['invalid_attachment'] };
+      }
       attachments.push(attachment);
     }
 
@@ -416,22 +440,42 @@ export class ChatService {
     return this.repos.messages.toggleReaction(input);
   }
 
-  saveAttachment(input: { fileName: string; mimeType?: string; bytes: Buffer }): Attachment {
+  saveAttachment(input: { fileName: string; mimeType?: string; bytes: Buffer; ownerUserId?: string }): Attachment {
     const config = this.getConfig();
     if (input.bytes.length > config.media.maxAttachmentBytes) {
       throw new Error('Attachment exceeds configured max size.');
     }
 
+    if (input.ownerUserId) {
+      const pending = this.repos.messages.getPendingAttachmentUsage(input.ownerUserId);
+      const maxPendingBytes = Math.max(
+        config.media.maxAttachmentBytes * MAX_ATTACHMENTS_PER_MESSAGE,
+        MIN_PENDING_ATTACHMENT_BYTES_PER_USER,
+      );
+      if (
+        pending.count >= MAX_PENDING_ATTACHMENTS_PER_USER ||
+        pending.bytes + input.bytes.length > maxPendingBytes
+      ) {
+        throw new Error('Too many pending attachments. Send or discard existing uploads before adding more.');
+      }
+    }
+
     const detectedMime = input.mimeType ?? lookupMime(input.fileName);
-    const mimeType = typeof detectedMime === 'string' ? detectedMime : 'application/octet-stream';
+    const mimeType = (typeof detectedMime === 'string' ? detectedMime : 'application/octet-stream')
+      .split(';')[0]
+      .trim()
+      .toLowerCase();
     const allowed = config.media.allowedMimePrefixes.some((prefix) => mimeType.startsWith(prefix));
 
     if (!allowed) {
       throw new Error('Attachment MIME type is not allowed.');
     }
+    if (BLOCKED_ATTACHMENT_MIME_TYPES.has(mimeType)) {
+      throw new Error('Attachment MIME type is not safe to serve.');
+    }
 
     const safeName = `${Date.now()}-${input.fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
-    const filePath = join(config.storage.uploadDir, safeName);
+    const filePath = resolve(config.storage.uploadDir, safeName);
     writeFileSync(filePath, input.bytes);
 
     return this.repos.messages.recordUploadedAttachment({
@@ -439,11 +483,28 @@ export class ChatService {
       mimeType,
       byteSize: input.bytes.length,
       path: filePath,
+      ownerUserId: input.ownerUserId,
     });
   }
 
   getAttachment(attachmentId: string): Attachment | null {
-    return this.repos.messages.findAttachmentById(attachmentId);
+    const attachment = this.repos.messages.findAttachmentById(attachmentId);
+    if (!attachment || !this.isStoredUploadPath(attachment.path)) {
+      return null;
+    }
+    return attachment;
+  }
+
+  private getPendingAttachment(attachmentId: string, ownerUserId: string): Attachment | null {
+    const attachment = this.repos.messages.findUnattachedAttachmentById(attachmentId, ownerUserId);
+    if (!attachment || !this.isStoredUploadPath(attachment.path)) {
+      return null;
+    }
+    return attachment;
+  }
+
+  private isStoredUploadPath(filePath: string): boolean {
+    return isPathInsideDirectory(this.getConfig().storage.uploadDir, filePath);
   }
 
   async searchGifs(query: string, limit = 20): Promise<GifSearchResponse> {

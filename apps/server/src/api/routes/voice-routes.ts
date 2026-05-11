@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { GatewayEvents } from '@current/protocol';
 import { z } from 'zod';
 import { requireAuth } from '../auth-guard.js';
-import { denyForbidden, hasChannelPermission } from '../permission-guard.js';
+import { denyForbidden, hasChannelPermission, hasServerPermission } from '../permission-guard.js';
 
 const ChannelParamsSchema = z.object({ channelId: z.string().min(1) });
 const TransportParamsSchema = z.object({ transportId: z.string().min(1) });
@@ -41,6 +41,11 @@ const ConsumeBodySchema = z.object({
 });
 
 const ProducerPatchBodySchema = z.object({
+  sessionId: z.string().min(1),
+  paused: z.boolean(),
+});
+
+const ConsumerPatchBodySchema = z.object({
   sessionId: z.string().min(1),
   paused: z.boolean(),
 });
@@ -92,6 +97,16 @@ function ensureVoiceChannelPermission(
     serverId: status.serverId,
     channelId: channel.id,
     user: request.currentUser,
+    permission: 'VIEW_CHANNEL',
+  })) {
+    reply.code(404).send({ error: 'Voice channel not found.' });
+    return false;
+  }
+
+  if (!hasChannelPermission(app.appContext, {
+    serverId: status.serverId,
+    channelId: channel.id,
+    user: request.currentUser,
     permission,
   })) {
     denyForbidden(reply, permission);
@@ -108,8 +123,26 @@ function sendVoiceError(reply: FastifyReply, error: unknown): void {
 }
 
 export async function registerVoiceRoutes(app: FastifyInstance): Promise<void> {
-  app.get('/voice/state', { preHandler: [requireAuth] }, async () => {
-    return app.appContext.voice.listState();
+  app.get('/voice/state', { preHandler: [requireAuth] }, async (request) => {
+    const status = app.appContext.setup.status();
+    if (!status.serverId || !request.currentUser) {
+      return [];
+    }
+
+    return app.appContext.voice.listState().filter((voiceState) =>
+      hasChannelPermission(app.appContext, {
+        serverId: status.serverId!,
+        channelId: voiceState.channelId,
+        user: request.currentUser!,
+        permission: 'VIEW_CHANNEL',
+      }) &&
+      hasChannelPermission(app.appContext, {
+        serverId: status.serverId!,
+        channelId: voiceState.channelId,
+        user: request.currentUser!,
+        permission: 'CONNECT_VOICE',
+      }),
+    );
   });
 
   app.post('/voice/channels/:channelId/token', { preHandler: [requireAuth] }, async (request, reply) => {
@@ -356,6 +389,33 @@ export async function registerVoiceRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
+  app.patch('/voice/consumers/:consumerId', { preHandler: [requireAuth] }, async (request, reply) => {
+    const params = ConsumerParamsSchema.safeParse(request.params);
+    const body = ConsumerPatchBodySchema.safeParse(request.body);
+    if (!params.success || !body.success) {
+      reply.code(400).send({ error: 'Invalid request.' });
+      return;
+    }
+    if (!ensureVoiceSession(app, request, reply, body.data.sessionId)) {
+      return;
+    }
+
+    try {
+      const consumer = await app.appContext.voice.setConsumerPaused({
+        sessionId: body.data.sessionId,
+        consumerId: params.data.consumerId,
+        paused: body.data.paused,
+      });
+      if (!consumer) {
+        reply.code(404).send({ error: 'Voice consumer not found.' });
+        return;
+      }
+      reply.send({ consumer });
+    } catch (error) {
+      sendVoiceError(reply, error);
+    }
+  });
+
   app.post('/voice/sessions/:sessionId/heartbeat', { preHandler: [requireAuth] }, async (request, reply) => {
     const params = SessionParamsSchema.safeParse(request.params);
     if (!params.success) {
@@ -380,6 +440,15 @@ export async function registerVoiceRoutes(app: FastifyInstance): Promise<void> {
       const status = app.appContext.setup.status();
       const current = app.appContext.voice.getUserState(request.currentUser.id);
       if (!status.serverId || !current) {
+        reply.code(404).send({ error: 'Voice state not found.' });
+        return;
+      }
+      if (!hasChannelPermission(app.appContext, {
+        serverId: status.serverId,
+        channelId: current.channelId,
+        user: request.currentUser,
+        permission: 'VIEW_CHANNEL',
+      })) {
         reply.code(404).send({ error: 'Voice state not found.' });
         return;
       }
@@ -417,11 +486,28 @@ export async function registerVoiceRoutes(app: FastifyInstance): Promise<void> {
       reply.code(400).send({ error: 'Invalid request.' });
       return;
     }
+    if (!ensureVoiceChannelPermission(app, request, reply, params.data.channelId, 'CONNECT_VOICE')) {
+      return;
+    }
 
     reply.send(app.appContext.voice.listChannelState(params.data.channelId));
   });
 
-  app.get('/voice/diagnostics', { preHandler: [requireAuth] }, async () => {
+  app.get('/voice/diagnostics', { preHandler: [requireAuth] }, async (request, reply) => {
+    const status = app.appContext.setup.status();
+    if (!status.serverId || !request.currentUser) {
+      reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+    if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'MANAGE_SERVER',
+    })) {
+      denyForbidden(reply, 'MANAGE_SERVER');
+      return;
+    }
+
     return app.appContext.voice.diagnostics();
   });
 }

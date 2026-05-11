@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { isIP } from 'node:net';
 import { z } from 'zod';
 
 const BootstrapSchema = z.object({
@@ -30,6 +31,22 @@ const BootstrapSchema = z.object({
   adminAvatarUrl: z.string().optional(),
 });
 
+function normalizeIpAddress(value: string): string {
+  return value.startsWith('::ffff:') ? value.slice('::ffff:'.length) : value;
+}
+
+function isLoopbackIpAddress(value: string): boolean {
+  const normalized = normalizeIpAddress(value);
+  if (normalized === '::1' || normalized === '127.0.0.1') {
+    return true;
+  }
+  if (isIP(normalized) !== 4) {
+    return false;
+  }
+  const [firstOctet] = normalized.split('.').map((segment) => Number(segment));
+  return firstOctet === 127;
+}
+
 export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
   app.get('/setup/status', async () => {
     return app.appContext.setup.status();
@@ -44,6 +61,15 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
 
     try {
       const currentUser = request.currentUser;
+      if (!currentUser && (!isLoopbackIpAddress(request.ip) || request.headers.origin)) {
+        reply.code(401).send({
+          error: {
+            code: 'SETUP_AUTH_REQUIRED',
+            message: 'First-run setup must be completed by a signed-in user.',
+          },
+        });
+        return;
+      }
       const payload = currentUser
         ? {
             ...parsed.data,

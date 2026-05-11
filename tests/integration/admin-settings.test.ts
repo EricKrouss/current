@@ -81,6 +81,30 @@ describe('admin settings and insights', () => {
 
     db.prepare('INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)').run('usr_admin', 'rol_manage_server');
 
+    const deniedRegistrationMode = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/server/registration-mode',
+      cookies: {
+        current_session: 'member_session',
+      },
+      payload: {
+        registrationMode: 'open_signup',
+      },
+    });
+    expect(deniedRegistrationMode.statusCode).toBe(403);
+
+    const allowedRegistrationMode = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/server/registration-mode',
+      cookies: {
+        current_session: 'admin_session',
+      },
+      payload: {
+        registrationMode: 'manual_approval',
+      },
+    });
+    expect(allowedRegistrationMode.statusCode).toBe(200);
+
     const deniedSettings = await app.inject({
       method: 'GET',
       url: '/api/v1/admin/settings',

@@ -1,4 +1,11 @@
-import type { Attachment, EncryptedMessageContent, Message, MessageReaction, PageResponse } from '@current/types';
+import type {
+  Attachment,
+  EncryptedMessageContent,
+  Message,
+  MessageAuthor,
+  MessageReaction,
+  PageResponse,
+} from '@current/types';
 import type { DatabaseSync } from 'node:sqlite';
 import { BaseRepository } from './base-repository.js';
 import { id } from '../../utils/id.js';
@@ -16,15 +23,23 @@ interface MessageRow {
   created_at: string;
   updated_at: string | null;
   deleted_at: string | null;
+  author_user_id?: string | null;
+  author_did?: string | null;
+  author_handle?: string | null;
+  author_display_name?: string | null;
+  author_avatar_url?: string | null;
+  author_bio?: string | null;
 }
 
 interface AttachmentRow {
   id: string;
   message_id: string | null;
+  owner_user_id: string | null;
   file_name: string;
   mime_type: string;
   byte_size: number;
   path: string;
+  created_at?: string;
 }
 
 interface ReactionAggregateRow {
@@ -33,6 +48,25 @@ interface ReactionAggregateRow {
   count: number;
   user_ids: string | null;
 }
+
+const MESSAGE_SELECT_COLUMNS = `
+  messages.id,
+  messages.channel_id,
+  messages.author_id,
+  messages.content,
+  messages.encrypted_content,
+  messages.parent_message_id,
+  messages.gif_url,
+  messages.created_at,
+  messages.updated_at,
+  messages.deleted_at,
+  users.id AS author_user_id,
+  users.did AS author_did,
+  users.handle AS author_handle,
+  users.display_name AS author_display_name,
+  users.avatar_url AS author_avatar_url,
+  users.bio AS author_bio
+`;
 
 export class MessagesRepository extends BaseRepository {
   constructor(db: DatabaseSync) {
@@ -48,24 +82,25 @@ export class MessagesRepository extends BaseRepository {
     const fetchLimit = input.limit + 1;
     const identityFilterSql =
       input.identityMode === 'lan'
-        ? "AND author_id IN (SELECT id FROM users WHERE did LIKE 'did:current:lan:%')"
+        ? "AND users.did LIKE 'did:current:lan:%'"
         : input.identityMode === 'atproto'
-          ? "AND author_id IN (SELECT id FROM users WHERE did NOT LIKE 'did:current:lan:%')"
+          ? "AND users.did NOT LIKE 'did:current:lan:%'"
           : '';
     const rows = input.before
       ? (this.db
           .prepare(
             `
-          SELECT *
+          SELECT ${MESSAGE_SELECT_COLUMNS}
           FROM messages
-          WHERE channel_id = ?
-            AND deleted_at IS NULL
+          LEFT JOIN users ON users.id = messages.author_id
+          WHERE messages.channel_id = ?
+            AND messages.deleted_at IS NULL
             ${identityFilterSql}
             AND (
-              created_at < ?
-              OR (created_at = ? AND id < ?)
+              messages.created_at < ?
+              OR (messages.created_at = ? AND messages.id < ?)
             )
-          ORDER BY created_at DESC, id DESC
+          ORDER BY messages.created_at DESC, messages.id DESC
           LIMIT ?
         `,
           )
@@ -79,11 +114,12 @@ export class MessagesRepository extends BaseRepository {
       : (this.db
           .prepare(
             `
-          SELECT *
+          SELECT ${MESSAGE_SELECT_COLUMNS}
           FROM messages
-          WHERE channel_id = ? AND deleted_at IS NULL
+          LEFT JOIN users ON users.id = messages.author_id
+          WHERE messages.channel_id = ? AND messages.deleted_at IS NULL
           ${identityFilterSql}
-          ORDER BY created_at DESC, id DESC
+          ORDER BY messages.created_at DESC, messages.id DESC
           LIMIT ?
         `,
           )
@@ -119,24 +155,24 @@ export class MessagesRepository extends BaseRepository {
   }): Message[] {
     const normalizedQuery = input.query?.trim();
     const params: string[] = [input.channelId];
-    const where: string[] = ['channel_id = ?', 'deleted_at IS NULL'];
+    const where: string[] = ['messages.channel_id = ?', 'messages.deleted_at IS NULL'];
 
     if (input.authorId) {
-      where.push('author_id = ?');
+      where.push('messages.author_id = ?');
       params.push(input.authorId);
     }
 
     if (input.identityMode === 'lan') {
-      where.push(`author_id IN (SELECT id FROM users WHERE did LIKE 'did:current:lan:%')`);
+      where.push(`users.did LIKE 'did:current:lan:%'`);
     } else if (input.identityMode === 'atproto') {
-      where.push(`author_id IN (SELECT id FROM users WHERE did NOT LIKE 'did:current:lan:%')`);
+      where.push(`users.did NOT LIKE 'did:current:lan:%'`);
     }
 
     if (normalizedQuery && normalizedQuery.length > 0) {
       where.push(`(
-        LOWER(id) LIKE LOWER(?)
-        OR LOWER(content) LIKE LOWER(?)
-        OR LOWER(COALESCE(gif_url, '')) LIKE LOWER(?)
+        LOWER(messages.id) LIKE LOWER(?)
+        OR LOWER(messages.content) LIKE LOWER(?)
+        OR LOWER(COALESCE(messages.gif_url, '')) LIKE LOWER(?)
       )`);
       params.push(`%${normalizedQuery}%`, `%${normalizedQuery}%`, `%${normalizedQuery}%`);
     }
@@ -144,10 +180,11 @@ export class MessagesRepository extends BaseRepository {
     const rows = this.db
       .prepare(
         `
-          SELECT *
+          SELECT ${MESSAGE_SELECT_COLUMNS}
           FROM messages
+          LEFT JOIN users ON users.id = messages.author_id
           WHERE ${where.join(' AND ')}
-          ORDER BY created_at DESC, id DESC
+          ORDER BY messages.created_at DESC, messages.id DESC
           LIMIT ?
         `,
       )
@@ -162,11 +199,20 @@ export class MessagesRepository extends BaseRepository {
     limit: number;
     authorId?: string;
     channelId?: string;
+    channelIds?: string[];
     identityMode?: 'all' | 'lan' | 'atproto';
   }): Message[] {
     const normalizedQuery = input.query?.trim();
     const params: string[] = [input.serverId];
     const where: string[] = ['channels.server_id = ?', 'messages.deleted_at IS NULL'];
+
+    if (input.channelIds) {
+      if (input.channelIds.length === 0) {
+        return [];
+      }
+      where.push(`messages.channel_id IN (${input.channelIds.map(() => '?').join(', ')})`);
+      params.push(...input.channelIds);
+    }
 
     if (input.channelId) {
       where.push('messages.channel_id = ?');
@@ -196,10 +242,10 @@ export class MessagesRepository extends BaseRepository {
     const rows = this.db
       .prepare(
         `
-          SELECT messages.*
+          SELECT ${MESSAGE_SELECT_COLUMNS}
           FROM messages
           INNER JOIN channels ON channels.id = messages.channel_id
-          INNER JOIN users ON users.id = messages.author_id
+          LEFT JOIN users ON users.id = messages.author_id
           WHERE ${where.join(' AND ')}
           ORDER BY messages.created_at DESC, messages.id DESC
           LIMIT ?
@@ -244,24 +290,20 @@ export class MessagesRepository extends BaseRepository {
       this.attachToMessage(attachment, messageId);
     }
 
-    return {
-      id: messageId,
-      channelId: input.channelId,
-      authorId: input.authorId,
-      content: input.content,
-      encryptedContent: input.encryptedContent,
-      parentMessageId: input.parentMessageId,
-      gifUrl: input.gifUrl,
-      attachments: input.attachments ?? [],
-      createdAt,
-      reactions: [],
-    };
+    return this.findById(messageId)!;
   }
 
   findById(messageId: string): Message | null {
-    const row = this.db.prepare('SELECT * FROM messages WHERE id = ?').get(messageId) as
-      | MessageRow
-      | undefined;
+    const row = this.db
+      .prepare(
+        `
+          SELECT ${MESSAGE_SELECT_COLUMNS}
+          FROM messages
+          LEFT JOIN users ON users.id = messages.author_id
+          WHERE messages.id = ?
+        `,
+      )
+      .get(messageId) as MessageRow | undefined;
     return row ? this.toMessage(row) : null;
   }
 
@@ -328,18 +370,48 @@ export class MessagesRepository extends BaseRepository {
 
   findAttachmentById(attachmentId: string): Attachment | null {
     const row = this.db
-      .prepare('SELECT id, file_name, mime_type, byte_size, path FROM attachments WHERE id = ?')
+      .prepare('SELECT id, message_id, owner_user_id, file_name, mime_type, byte_size, path FROM attachments WHERE id = ?')
       .get(attachmentId) as AttachmentRow | undefined;
     if (!row) {
       return null;
     }
 
+    return this.toAttachment(row);
+  }
+
+  findUnattachedAttachmentById(attachmentId: string, ownerUserId?: string): Attachment | null {
+    const ownerSql = ownerUserId ? 'AND owner_user_id = ?' : '';
+    const params = ownerUserId ? [attachmentId, ownerUserId] : [attachmentId];
+    const row = this.db
+      .prepare(
+        `
+          SELECT id, message_id, owner_user_id, file_name, mime_type, byte_size, path
+          FROM attachments
+          WHERE id = ? AND message_id IS NULL ${ownerSql}
+        `,
+      )
+      .get(...params) as AttachmentRow | undefined;
+    if (!row) {
+      return null;
+    }
+
+    return this.toAttachment(row);
+  }
+
+  getPendingAttachmentUsage(ownerUserId: string): { count: number; bytes: number } {
+    const row = this.db
+      .prepare(
+        `
+          SELECT COUNT(*) AS count, COALESCE(SUM(byte_size), 0) AS bytes
+          FROM attachments
+          WHERE owner_user_id = ? AND message_id IS NULL
+        `,
+      )
+      .get(ownerUserId) as { count: number; bytes: number } | undefined;
+
     return {
-      id: row.id,
-      fileName: row.file_name,
-      mimeType: row.mime_type,
-      byteSize: row.byte_size,
-      path: row.path,
+      count: row?.count ?? 0,
+      bytes: row?.bytes ?? 0,
     };
   }
 
@@ -348,19 +420,29 @@ export class MessagesRepository extends BaseRepository {
     mimeType: string;
     byteSize: number;
     path: string;
+    ownerUserId?: string;
   }): Attachment {
     const attachmentId = id('att');
     this.db
       .prepare(
         `
-      INSERT INTO attachments (id, message_id, file_name, mime_type, byte_size, path, created_at)
-      VALUES (?, NULL, ?, ?, ?, ?, ?)
+      INSERT INTO attachments (id, message_id, owner_user_id, file_name, mime_type, byte_size, path, created_at)
+      VALUES (?, NULL, ?, ?, ?, ?, ?, ?)
     `,
       )
-      .run(attachmentId, input.fileName, input.mimeType, input.byteSize, input.path, nowIso());
+      .run(
+        attachmentId,
+        input.ownerUserId ?? null,
+        input.fileName,
+        input.mimeType,
+        input.byteSize,
+        input.path,
+        nowIso(),
+      );
 
     return {
       id: attachmentId,
+      ownerUserId: input.ownerUserId,
       fileName: input.fileName,
       mimeType: input.mimeType,
       byteSize: input.byteSize,
@@ -382,16 +464,10 @@ export class MessagesRepository extends BaseRepository {
 
   private loadAttachments(messageId: string): Attachment[] {
     const rows = this.db
-      .prepare('SELECT id, file_name, mime_type, byte_size, path FROM attachments WHERE message_id = ?')
+      .prepare('SELECT id, message_id, owner_user_id, file_name, mime_type, byte_size, path FROM attachments WHERE message_id = ?')
       .all(messageId) as unknown as AttachmentRow[];
 
-    return rows.map((row) => ({
-      id: row.id,
-      fileName: row.file_name,
-      mimeType: row.mime_type,
-      byteSize: row.byte_size,
-      path: row.path,
-    }));
+    return rows.map((row) => this.toAttachment(row));
   }
 
   private loadAttachmentsForMessages(messageIds: string[]): Map<string, Attachment[]> {
@@ -407,7 +483,7 @@ export class MessagesRepository extends BaseRepository {
     const rows = this.db
       .prepare(
         `
-          SELECT id, message_id, file_name, mime_type, byte_size, path
+          SELECT id, message_id, owner_user_id, file_name, mime_type, byte_size, path
           FROM attachments
           WHERE message_id IN (${placeholders})
           ORDER BY created_at ASC, id ASC
@@ -425,16 +501,22 @@ export class MessagesRepository extends BaseRepository {
         continue;
       }
 
-      attachments.push({
-        id: row.id,
-        fileName: row.file_name,
-        mimeType: row.mime_type,
-        byteSize: row.byte_size,
-        path: row.path,
-      });
+      attachments.push(this.toAttachment(row));
     }
 
     return map;
+  }
+
+  private toAttachment(row: AttachmentRow): Attachment {
+    return {
+      id: row.id,
+      messageId: row.message_id ?? undefined,
+      ownerUserId: row.owner_user_id ?? undefined,
+      fileName: row.file_name,
+      mimeType: row.mime_type,
+      byteSize: row.byte_size,
+      path: row.path,
+    };
   }
 
   private loadReactions(messageId: string): MessageReaction[] {
@@ -514,6 +596,7 @@ export class MessagesRepository extends BaseRepository {
       id: row.id,
       channelId: row.channel_id,
       authorId: row.author_id,
+      author: this.toAuthor(row),
       content: row.content,
       encryptedContent: this.parseEncryptedContent(row.encrypted_content),
       parentMessageId: row.parent_message_id ?? undefined,
@@ -523,6 +606,21 @@ export class MessagesRepository extends BaseRepository {
       updatedAt: row.updated_at ?? undefined,
       deletedAt: row.deleted_at ?? undefined,
       reactions: reactions ?? this.loadReactions(row.id),
+    };
+  }
+
+  private toAuthor(row: MessageRow): MessageAuthor | undefined {
+    if (!row.author_user_id || !row.author_did) {
+      return undefined;
+    }
+
+    return {
+      id: row.author_user_id,
+      did: row.author_did,
+      handle: row.author_handle ?? row.author_did,
+      displayName: row.author_display_name ?? row.author_handle ?? row.author_did,
+      avatarUrl: row.author_avatar_url ?? undefined,
+      bio: row.author_bio ?? undefined,
     };
   }
 

@@ -15,6 +15,8 @@ const isWindows = process.platform === 'win32';
 const checkOnly = process.argv.includes('--check');
 const validModes = new Set(['normal', 'dev']);
 const validInstances = new Set(['standard', 'lan']);
+const defaultStandardPort = 6414;
+const defaultLanPort = 8081;
 const standardConfigPath = join(serverRoot, 'config', 'current.config.json');
 const lanConfigPath = join(serverRoot, 'config', 'current-lan.config.json');
 const standardStorage = {
@@ -144,7 +146,7 @@ function normalizeBrowserHost(host) {
 }
 
 function defaultLaunchConfig(instance) {
-  const port = instance === 'lan' ? 8081 : 8080;
+  const port = instance === 'lan' ? defaultLanPort : defaultStandardPort;
   return {
     host: '0.0.0.0',
     port,
@@ -152,11 +154,59 @@ function defaultLaunchConfig(instance) {
   };
 }
 
-async function readServerLaunchConfig(instance) {
+function normalizePort(value) {
+  const port = Number(String(value).trim());
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid port "${value}". Use a number from 1 to 65535.`);
+  }
+  return port;
+}
+
+function parsePortArg() {
+  const args = process.argv.slice(2);
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--port') {
+      const value = args[index + 1];
+      if (!value) {
+        throw new Error('Missing value for --port.');
+      }
+      return normalizePort(value);
+    }
+    if (arg.startsWith('--port=')) {
+      return normalizePort(arg.slice('--port='.length));
+    }
+  }
+
+  const envValue =
+    process.env.CURRENT_PORT?.trim() ||
+    process.env.CURRENT_SERVER_PORT?.trim() ||
+    process.env.PORT?.trim();
+  return envValue ? normalizePort(envValue) : null;
+}
+
+function withPort(url, port) {
+  const parsed = new URL(url);
+  parsed.port = String(port);
+  return parsed.toString();
+}
+
+function applyLaunchPortOverride(config, portOverride) {
+  if (!portOverride) {
+    return config;
+  }
+  return {
+    ...config,
+    port: portOverride,
+    url: withPort(config.url, portOverride),
+  };
+}
+
+async function readServerLaunchConfig(instance, portOverride) {
   const fallback = defaultLaunchConfig(instance);
   const configPath = resolveConfigPath(instance);
   if (!existsSync(configPath)) {
-    return fallback;
+    return applyLaunchPortOverride(fallback, portOverride);
   }
 
   try {
@@ -166,13 +216,13 @@ async function readServerLaunchConfig(instance) {
     const port = Number.isInteger(server?.port) && server.port > 0 ? server.port : fallback.port;
     const protocol = server?.tls?.enabled ? 'https' : 'http';
     const url = `${protocol}://${normalizeBrowserHost(host)}:${port}`;
-    return {
+    return applyLaunchPortOverride({
       host,
       port,
       url,
-    };
+    }, portOverride);
   } catch {
-    return fallback;
+    return applyLaunchPortOverride(fallback, portOverride);
   }
 }
 
@@ -183,8 +233,8 @@ function buildLanDefaultConfig() {
       name: 'Current LAN Server',
       slug: 'current-lan-server',
       host: '0.0.0.0',
-      port: 8081,
-      publicUrl: 'http://127.0.0.1:8081',
+      port: defaultLanPort,
+      publicUrl: `http://127.0.0.1:${defaultLanPort}`,
       registrationMode: 'open_signup',
       tls: {
         enabled: false,
@@ -195,7 +245,7 @@ function buildLanDefaultConfig() {
     auth: {
       mode: 'lan',
       atprotoClientId: '',
-      redirectUri: 'http://127.0.0.1:8081/api/v1/auth/oauth/callback',
+      redirectUri: `http://127.0.0.1:${defaultLanPort}/api/v1/auth/oauth/callback`,
       lanRedirectBaseUrl: '',
       authorizationEndpoint: 'https://bsky.social/oauth/authorize',
       tokenEndpoint: 'https://bsky.social/oauth/token',
@@ -265,20 +315,29 @@ function patchLanConfig(rawConfig) {
     server: {
       ...defaultConfig.server,
       ...server,
-      port: server.port === 8080 || server.port === undefined ? 8081 : server.port,
+      port:
+        server.port === 8080 || server.port === defaultStandardPort || server.port === undefined
+          ? defaultLanPort
+          : server.port,
       publicUrl:
-        typeof server.publicUrl === 'string' && server.publicUrl.length > 0 && !server.publicUrl.includes(':8080')
+        typeof server.publicUrl === 'string' &&
+        server.publicUrl.length > 0 &&
+        !server.publicUrl.includes(':8080') &&
+        !server.publicUrl.includes(`:${defaultStandardPort}`)
           ? server.publicUrl
-          : 'http://127.0.0.1:8081',
+          : `http://127.0.0.1:${defaultLanPort}`,
     },
     auth: {
       ...defaultConfig.auth,
       ...auth,
       mode: 'lan',
       redirectUri:
-        typeof auth.redirectUri === 'string' && auth.redirectUri.length > 0 && !auth.redirectUri.includes(':8080')
+        typeof auth.redirectUri === 'string' &&
+        auth.redirectUri.length > 0 &&
+        !auth.redirectUri.includes(':8080') &&
+        !auth.redirectUri.includes(`:${defaultStandardPort}`)
           ? auth.redirectUri
-          : 'http://127.0.0.1:8081/api/v1/auth/oauth/callback',
+          : `http://127.0.0.1:${defaultLanPort}/api/v1/auth/oauth/callback`,
     },
     storage: {
       ...defaultConfig.storage,
@@ -585,13 +644,17 @@ async function main() {
   await ensureDependencies(pm);
 
   const instance = await chooseInstance();
+  const portOverride = parsePortArg();
   const configPath = await ensureInstanceConfig(instance);
   const mode = await chooseMode();
-  const launchConfig = await readServerLaunchConfig(instance);
+  const launchConfig = await readServerLaunchConfig(instance, portOverride);
 
   console.log(`[Current] Instance: ${instance}`);
   console.log(`[Current] Config: ${configPath}`);
   console.log(`[Current] Mode: ${mode}`);
+  if (portOverride) {
+    console.log(`[Current] Port override: ${portOverride}`);
+  }
   console.log(`[Current] The server will be available at ${launchConfig.url} after startup.`);
   if (instance === 'lan') {
     const urls = localLanUrls(launchConfig.port);
@@ -615,6 +678,7 @@ async function main() {
     await run(...pm(['dev']), 'Current dev server', {
       CURRENT_CONFIG_PATH: configPath,
       CURRENT_SERVER_INSTANCE: instance,
+      ...(portOverride ? { CURRENT_PORT: String(portOverride) } : {}),
     });
     return;
   }
@@ -627,6 +691,7 @@ async function main() {
     {
       CURRENT_CONFIG_PATH: configPath,
       CURRENT_SERVER_INSTANCE: instance,
+      ...(portOverride ? { CURRENT_PORT: String(portOverride) } : {}),
       CURRENT_WEB_DIST_DIR: webDistDir,
     },
   );

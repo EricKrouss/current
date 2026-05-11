@@ -82,6 +82,11 @@ export interface VoiceSfuAdapter {
     sessionId: string;
     consumerId: string;
   }): Promise<void>;
+  setConsumerPaused(input: {
+    sessionId: string;
+    consumerId: string;
+    paused: boolean;
+  }): Promise<VoiceConsumerInfo | null>;
   closeSession(sessionId: string): Promise<VoiceSessionCloseResult | null>;
   closeUserSession(userId: string): Promise<VoiceSessionCloseResult | null>;
   setProducerPaused(input: {
@@ -97,6 +102,13 @@ export interface VoiceSfuAdapter {
     sessions: number;
     producers: number;
     workerCount: number;
+    workerLoads?: Array<{
+      index: number;
+      rooms: number;
+      sessions: number;
+      producers: number;
+    }>;
+    idleShutdownPending?: boolean;
   };
   close(): Promise<void>;
 }

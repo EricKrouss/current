@@ -2,6 +2,7 @@ import { createReadStream } from 'node:fs';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { GatewayEvents } from '@current/protocol';
+import type { Channel, CurrentUser } from '@current/types';
 import { requireAuth } from '../auth-guard.js';
 import { denyForbidden, hasChannelPermission, hasServerPermission } from '../permission-guard.js';
 import { decodeCursor } from '../../utils/cursor.js';
@@ -60,8 +61,9 @@ const MessageCreateSchema = z
     content: z.string().max(4000).optional().default(''),
     encryptedContent: EncryptedMessageContentSchema.optional(),
     parentMessageId: z.string().optional(),
+    notificationMentions: z.array(z.string().trim().min(1).max(253)).max(32).optional(),
     gifUrl: z.string().url().optional(),
-    attachmentIds: z.array(z.string()).optional(),
+    attachmentIds: z.array(z.string().trim().min(1).max(128)).max(10).optional(),
   })
   .superRefine((value, context) => {
     if (value.encryptedContent && value.content.trim().length > 0) {
@@ -72,6 +74,22 @@ const MessageCreateSchema = z
       });
     }
   });
+
+function normalizeNotificationMentionHandle(handle: string): string | null {
+  const normalized = handle.trim().replace(/^@/, '').toLowerCase();
+  return /^[a-z0-9._-]+$/.test(normalized) ? normalized : null;
+}
+
+function normalizeNotificationMentionHandles(handles: string[] | undefined): string[] {
+  const normalized = new Set<string>();
+  for (const handle of handles ?? []) {
+    const value = normalizeNotificationMentionHandle(handle);
+    if (value) {
+      normalized.add(value);
+    }
+  }
+  return [...normalized];
+}
 
 const MessagePatchSchema = z
   .object({
@@ -119,6 +137,52 @@ const ReactionSchema = z.object({
   emoji: z.string().min(1).max(32),
 });
 
+const AttachmentUploadQuerySchema = z.object({
+  channelId: z.string().trim().min(1).max(128).optional(),
+});
+
+function isConfiguredServerAsset(app: FastifyInstance, attachmentId: string): boolean {
+  const server = app.appContext.repos.servers.getPrimaryServer();
+  const config = app.appContext.serverConfig.get();
+  return (
+    server?.iconAttachmentId === attachmentId ||
+    server?.bannerAttachmentId === attachmentId ||
+    config.appearance.backgroundAttachmentId === attachmentId
+  );
+}
+
+function canViewChannel(app: FastifyInstance, input: { serverId: string; channelId: string; user: CurrentUser }): boolean {
+  return hasChannelPermission(app.appContext, {
+    serverId: input.serverId,
+    channelId: input.channelId,
+    user: input.user,
+    permission: 'VIEW_CHANNEL',
+  });
+}
+
+function filterVisibleChannels(
+  app: FastifyInstance,
+  input: { serverId: string; user: CurrentUser; channels: Channel[] },
+): Channel[] {
+  return input.channels.filter((channel) =>
+    canViewChannel(app, {
+      serverId: input.serverId,
+      channelId: channel.id,
+      user: input.user,
+    }),
+  );
+}
+
+function visibleMessageChannelIds(app: FastifyInstance, input: { serverId: string; user: CurrentUser }): string[] {
+  return filterVisibleChannels(app, {
+    serverId: input.serverId,
+    user: input.user,
+    channels: app.appContext.repos.channels.listAll(input.serverId),
+  })
+    .filter((channel) => channel.type === 'text' || channel.type === 'dm')
+    .map((channel) => channel.id);
+}
+
 export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
   app.get('/channels', { preHandler: [requireAuth] }, async (request, reply) => {
     const query = ChannelsQuerySchema.safeParse(request.query);
@@ -150,11 +214,24 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       };
     }
 
-    return app.appContext.chat.listChannelsPage({
+    if (!request.currentUser) {
+      reply.code(401).send({ error: 'Unauthorized.' });
+      return;
+    }
+
+    const page = app.appContext.chat.listChannelsPage({
       serverId: status.serverId,
       limit: query.data.limit ?? 75,
       after: after?.success ? after.data : undefined,
     });
+    return {
+      ...page,
+      items: filterVisibleChannels(app, {
+        serverId: status.serverId,
+        user: request.currentUser,
+        channels: page.items,
+      }),
+    };
   });
 
   app.post('/channels', { preHandler: [requireAuth] }, async (request, reply) => {
@@ -328,11 +405,15 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       return;
     }
 
-    app.appContext.chat.deleteChannel({
+    const deleted = app.appContext.chat.deleteChannel({
       channelId: params.data.channelId,
       serverId: status.serverId,
       actorId: request.currentUser.id,
     });
+    if (!deleted) {
+      reply.code(404).send({ error: 'Channel not found.' });
+      return;
+    }
 
     app.appContext.gateway.broadcast(GatewayEvents.PRESENCE_UPDATE, {
       action: 'channel_delete',
@@ -363,6 +444,26 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       return;
     }
 
+    const status = app.appContext.setup.status();
+    if (!status.serverId) {
+      reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+
+    const channel = app.appContext.chat.getChannelById(params.channelId);
+    if (!channel || channel.serverId !== status.serverId) {
+      reply.code(404).send({ error: 'Channel not found.' });
+      return;
+    }
+    if (!request.currentUser || !canViewChannel(app, {
+      serverId: status.serverId,
+      channelId: channel.id,
+      user: request.currentUser,
+    })) {
+      reply.code(404).send({ error: 'Channel not found.' });
+      return;
+    }
+
     const identityMode = app.appContext.serverConfig.get().auth.mode === 'lan' ? 'lan' : 'atproto';
     return app.appContext.chat.listMessagesPage({
       channelId: params.channelId,
@@ -380,8 +481,22 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       return;
     }
 
+    const status = app.appContext.setup.status();
+    if (!status.serverId) {
+      reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+
     const channel = app.appContext.chat.getChannelById(params.data.channelId);
-    if (!channel) {
+    if (!channel || channel.serverId !== status.serverId) {
+      reply.code(404).send({ error: 'Channel not found.' });
+      return;
+    }
+    if (!request.currentUser || !canViewChannel(app, {
+      serverId: status.serverId,
+      channelId: channel.id,
+      user: request.currentUser,
+    })) {
       reply.code(404).send({ error: 'Channel not found.' });
       return;
     }
@@ -409,6 +524,10 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
     if (!status.serverId) {
       return { items: [] };
     }
+    if (!request.currentUser) {
+      reply.code(401).send({ error: 'Unauthorized.' });
+      return;
+    }
 
     if (query.data.channelId) {
       const channel = app.appContext.chat.getChannelById(query.data.channelId);
@@ -416,9 +535,23 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
         reply.code(404).send({ error: 'Channel not found.' });
         return;
       }
+      if (!canViewChannel(app, {
+        serverId: status.serverId,
+        channelId: channel.id,
+        user: request.currentUser,
+      })) {
+        reply.code(404).send({ error: 'Channel not found.' });
+        return;
+      }
     }
 
     const identityMode = app.appContext.serverConfig.get().auth.mode === 'lan' ? 'lan' : 'atproto';
+    const channelIds = query.data.channelId
+      ? [query.data.channelId]
+      : visibleMessageChannelIds(app, {
+          serverId: status.serverId,
+          user: request.currentUser,
+        });
     return {
       items: app.appContext.chat.searchMessagesInServer({
         serverId: status.serverId,
@@ -426,6 +559,7 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
         limit: query.data.limit ?? 10,
         authorId: query.data.from,
         channelId: query.data.channelId,
+        channelIds,
         identityMode,
       }),
     };
@@ -455,6 +589,14 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       reply.code(404).send({ error: 'Message not found.' });
       return;
     }
+    if (!request.currentUser || !canViewChannel(app, {
+      serverId: status.serverId,
+      channelId: message.channelId,
+      user: request.currentUser,
+    })) {
+      reply.code(404).send({ error: 'Message not found.' });
+      return;
+    }
 
     reply.send(message);
   });
@@ -476,6 +618,14 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
 
     const channel = app.appContext.chat.getChannelById(params.data.channelId);
     if (!channel || channel.serverId !== status.serverId) {
+      reply.code(404).send({ error: 'Channel not found.' });
+      return;
+    }
+    if (!canViewChannel(app, {
+      serverId: status.serverId,
+      channelId: channel.id,
+      user: request.currentUser,
+    })) {
       reply.code(404).send({ error: 'Channel not found.' });
       return;
     }
@@ -531,8 +681,26 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       return;
     }
 
+    const mentionHandles = normalizeNotificationMentionHandles(body.data.notificationMentions);
+    const identityMode = app.appContext.serverConfig.get().auth.mode === 'lan' ? 'lan' : 'atproto';
+    const parentMessage = result.message.parentMessageId
+      ? app.appContext.chat.getMessageById({
+          messageId: result.message.parentMessageId,
+          serverId: status.serverId,
+          identityMode,
+        })
+      : null;
+    const notification =
+      mentionHandles.length > 0 || parentMessage?.authorId
+        ? {
+            ...(mentionHandles.length > 0 ? { mentionHandles } : {}),
+            ...(parentMessage?.authorId ? { replyToUserId: parentMessage.authorId } : {}),
+          }
+        : undefined;
+
     app.appContext.gateway.broadcast(GatewayEvents.MESSAGE_CREATE, {
       message: result.message,
+      ...(notification ? { notification } : {}),
     });
 
     reply.code(201).send(result.message);
@@ -566,6 +734,15 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
 
     if (!status.serverId || channel.serverId !== status.serverId) {
       reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+
+    if (!canViewChannel(app, {
+      serverId: status.serverId,
+      channelId: channel.id,
+      user: request.currentUser,
+    })) {
+      reply.code(404).send({ error: 'Channel not found.' });
       return;
     }
 
@@ -608,6 +785,14 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       serverId: status.serverId,
     });
     if (!existing) {
+      reply.code(404).send({ error: 'Message not found.' });
+      return;
+    }
+    if (!canViewChannel(app, {
+      serverId: status.serverId,
+      channelId: existing.channelId,
+      user: request.currentUser,
+    })) {
       reply.code(404).send({ error: 'Message not found.' });
       return;
     }
@@ -658,6 +843,14 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       serverId: status.serverId,
     });
     if (!existing) {
+      reply.code(404).send({ error: 'Message not found.' });
+      return;
+    }
+    if (!canViewChannel(app, {
+      serverId: status.serverId,
+      channelId: existing.channelId,
+      user: request.currentUser,
+    })) {
       reply.code(404).send({ error: 'Message not found.' });
       return;
     }
@@ -713,6 +906,14 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       reply.code(404).send({ error: 'Message not found.' });
       return;
     }
+    if (!canViewChannel(app, {
+      serverId: status.serverId,
+      channelId: existing.channelId,
+      user: request.currentUser,
+    })) {
+      reply.code(404).send({ error: 'Message not found.' });
+      return;
+    }
 
     if (!hasChannelPermission(app.appContext, {
       serverId: status.serverId,
@@ -743,6 +944,47 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post('/media/attachments', { preHandler: [requireAuth] }, async (request, reply) => {
+    const status = app.appContext.setup.status();
+    const query = AttachmentUploadQuerySchema.safeParse(request.query);
+    if (!status.serverId || !request.currentUser || !query.success) {
+      reply.code(400).send({ error: 'Invalid request.' });
+      return;
+    }
+
+    if (query.data.channelId) {
+      const channel = app.appContext.chat.getChannelById(query.data.channelId);
+      if (!channel || channel.serverId !== status.serverId) {
+        reply.code(404).send({ error: 'Channel not found.' });
+        return;
+      }
+
+      if (!canViewChannel(app, {
+        serverId: status.serverId,
+        channelId: channel.id,
+        user: request.currentUser,
+      })) {
+        reply.code(404).send({ error: 'Channel not found.' });
+        return;
+      }
+
+      if (!hasChannelPermission(app.appContext, {
+        serverId: status.serverId,
+        channelId: channel.id,
+        user: request.currentUser,
+        permission: 'ATTACH_FILES',
+      })) {
+        denyForbidden(reply, 'ATTACH_FILES');
+        return;
+      }
+    } else if (!hasServerPermission(app.appContext, {
+      serverId: status.serverId,
+      user: request.currentUser,
+      permission: 'ATTACH_FILES',
+    })) {
+      denyForbidden(reply, 'ATTACH_FILES');
+      return;
+    }
+
     const file = await request.file();
     if (!file) {
       reply.code(400).send({ error: 'No file uploaded.' });
@@ -755,6 +997,7 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
         fileName: file.filename,
         mimeType: file.mimetype,
         bytes,
+        ownerUserId: request.currentUser.id,
       });
       reply.code(201).send(attachment);
     } catch (error) {
@@ -780,7 +1023,48 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       return;
     }
 
-    reply.type(attachment.mimeType);
+    const status = app.appContext.setup.status();
+    if (!status.serverId || !request.currentUser) {
+      reply.code(404).send({ error: 'Server not configured.' });
+      return;
+    }
+
+    if (attachment.messageId) {
+      const identityMode = app.appContext.serverConfig.get().auth.mode === 'lan' ? 'lan' : 'atproto';
+      const message = app.appContext.chat.getMessageById({
+        messageId: attachment.messageId,
+        serverId: status.serverId,
+        identityMode,
+      });
+      if (!message) {
+        reply.code(404).send({ error: 'Attachment not found.' });
+        return;
+      }
+      if (!canViewChannel(app, {
+        serverId: status.serverId,
+        channelId: message.channelId,
+        user: request.currentUser,
+      })) {
+        reply.code(404).send({ error: 'Attachment not found.' });
+        return;
+      }
+    } else if (
+      attachment.ownerUserId !== request.currentUser.id &&
+      !isConfiguredServerAsset(app, attachment.id) &&
+      !hasServerPermission(app.appContext, {
+        serverId: status.serverId,
+        user: request.currentUser,
+        permission: 'MANAGE_SERVER',
+      })
+    ) {
+      reply.code(404).send({ error: 'Attachment not found.' });
+      return;
+    }
+
+    reply
+      .type(attachment.mimeType)
+      .header('X-Content-Type-Options', 'nosniff')
+      .header('Content-Disposition', `inline; filename="${attachment.fileName.replace(/["\\\r\n]/g, '_')}"`);
     return reply.send(createReadStream(attachment.path));
   });
 

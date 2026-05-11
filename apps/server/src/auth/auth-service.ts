@@ -13,6 +13,7 @@ import {
 import type { CurrentUser } from '@current/types';
 import type { RepositoryBag } from '../db/repositories/index.js';
 import type { ServerConfigService } from '../services/server-config-service.js';
+import { grantDefaultMemberRole, userHasServerRole } from '../services/access-control.js';
 import { addHours } from '../utils/time.js';
 import { id } from '../utils/id.js';
 
@@ -21,10 +22,22 @@ interface OAuthProfileResponse {
   handle?: string;
   displayName?: string;
   avatar?: string;
+  description?: string;
+}
+
+export interface AuthLoginResult {
+  user: CurrentUser;
+  sessionToken: string;
+  isNewUser: boolean;
+}
+
+export interface OAuthCallbackResult extends AuthLoginResult {
+  returnTo?: string;
 }
 
 const OAUTH_STATE_PREFIX = 'oauth:state:';
 const OAUTH_SESSION_PREFIX = 'oauth:session:';
+const PROFILE_FETCH_TIMEOUT_MS = 1_000;
 export const LOOPBACK_REMOTE_RETURN_TO_CODE = 'LOOPBACK_REMOTE_RETURN_TO';
 
 export class AuthService {
@@ -59,22 +72,26 @@ export class AuthService {
 
   async handleOAuthCallback(
     params: URLSearchParams,
-  ): Promise<{ user: CurrentUser; sessionToken: string; returnTo?: string }> {
+  ): Promise<OAuthCallbackResult> {
     const client = await this.getOAuthClient();
     const { session, state } = await client.callback(params);
-    const existing = this.repos.users.findByDid(session.did);
     const profile = await this.fetchProfile(session.did);
 
     const did = profile.did ?? session.did;
+    const existing =
+      this.repos.users.findByDid(session.did) ??
+      (did !== session.did ? this.repos.users.findByDid(did) : null);
     const handle = this.normalizeResolvedHandle(profile.handle) ?? existing?.handle ?? did;
     const displayName = profile.displayName ?? existing?.displayName ?? handle;
     const avatarUrl = profile.avatar ?? existing?.avatarUrl;
+    const bio = profile.description ?? existing?.bio;
 
     const user = this.ensureDefaultMemberRole(this.repos.users.upsertByDid({
       did,
       handle,
       displayName,
       avatarUrl,
+      bio,
     }));
 
     const sessionToken = id('sess');
@@ -84,6 +101,7 @@ export class AuthService {
     return {
       user,
       sessionToken,
+      isNewUser: !existing,
       returnTo,
     };
   }
@@ -93,28 +111,34 @@ export class AuthService {
     handle?: string;
     displayName?: string;
     avatar?: string;
-  }): Promise<{ user: CurrentUser; sessionToken: string }> {
-    const existing = this.repos.users.findByDid(input.did);
+    bio?: string;
+  }): Promise<AuthLoginResult> {
     const profile = await this.fetchProfile(input.did);
 
     const did = profile.did ?? input.did;
+    const existing =
+      this.repos.users.findByDid(input.did) ??
+      (did !== input.did ? this.repos.users.findByDid(did) : null);
     const handle =
       this.normalizeResolvedHandle(profile.handle ?? input.handle) ?? existing?.handle ?? did;
     const displayName =
       profile.displayName ?? input.displayName?.trim() ?? existing?.displayName ?? handle;
     const avatarUrl = profile.avatar ?? input.avatar ?? existing?.avatarUrl;
+    const inputBio = input.bio?.trim();
+    const bio = profile.description ?? (inputBio && inputBio.length > 0 ? inputBio : undefined) ?? existing?.bio;
 
     const user = this.ensureDefaultMemberRole(this.repos.users.upsertByDid({
       did,
       handle,
       displayName,
       avatarUrl,
+      bio,
     }));
 
     const sessionToken = id('sess');
     this.repos.users.setSession(sessionToken, user.id, addHours(24));
 
-    return { user, sessionToken };
+    return { user, sessionToken, isNewUser: !existing };
   }
 
   async hydrateProfile(user: CurrentUser): Promise<CurrentUser> {
@@ -123,21 +147,24 @@ export class AuthService {
     const handle = this.normalizeResolvedHandle(profile.handle) ?? user.handle;
     const displayName = profile.displayName ?? user.displayName ?? handle;
     const avatarUrl = profile.avatar ?? user.avatarUrl;
+    const bio = profile.description ?? user.bio;
 
     return this.ensureDefaultMemberRole(this.repos.users.upsertByDid({
       did,
       handle,
       displayName,
       avatarUrl,
+      bio,
     }));
   }
 
-  devLogin(input?: { handle?: string; displayName?: string }): { user: CurrentUser; sessionToken: string } {
+  devLogin(input?: { handle?: string; displayName?: string }): AuthLoginResult {
     const rawHandle = input?.handle?.trim().toLowerCase();
     const handle = rawHandle && rawHandle.length > 0 ? rawHandle : 'local.dev@current';
     const displayName = input?.displayName?.trim() || 'Local Developer';
     const didSuffix = createHash('sha256').update(handle).digest('hex').slice(0, 24);
     const did = `did:current:dev:${didSuffix}`;
+    const existing = this.repos.users.findByDid(did);
 
     const user = this.ensureDefaultMemberRole(this.repos.users.upsertByDid({
       did,
@@ -148,10 +175,10 @@ export class AuthService {
     const sessionToken = id('sess');
     this.repos.users.setSession(sessionToken, user.id, addHours(24));
 
-    return { user, sessionToken };
+    return { user, sessionToken, isNewUser: !existing };
   }
 
-  lanLogin(input: { screenName: string }): { user: CurrentUser; sessionToken: string } {
+  lanLogin(input: { screenName: string }): AuthLoginResult {
     const screenName = input.screenName.trim().replace(/\s+/g, ' ');
     if (screenName.length < 2) {
       throw new Error('Screen name must be at least 2 characters.');
@@ -172,6 +199,7 @@ export class AuthService {
     const handle = `${slug}.lan`;
     const didSuffix = createHash('sha256').update(handle).digest('hex').slice(0, 24);
     const did = `did:current:lan:${didSuffix}`;
+    const existing = this.repos.users.findByDid(did);
 
     const user = this.ensureDefaultMemberRole(this.repos.users.upsertByDid({
       did,
@@ -182,7 +210,7 @@ export class AuthService {
     const sessionToken = id('sess');
     this.repos.users.setSession(sessionToken, user.id, addHours(24));
 
-    return { user, sessionToken };
+    return { user, sessionToken, isNewUser: !existing };
   }
 
   getUserBySession(sessionToken?: string): CurrentUser | null {
@@ -198,15 +226,20 @@ export class AuthService {
       return user;
     }
 
-    const memberRole = this.repos.roles
-      .list(server.id)
-      .find((role) => role.name.toLowerCase() === 'member');
-    if (!memberRole || user.roleIds.includes(memberRole.id)) {
+    if (userHasServerRole(this.repos, { serverId: server.id, user })) {
       return user;
     }
 
-    this.repos.users.addRole(user.id, memberRole.id);
-    return this.repos.users.findById(user.id) ?? user;
+    const registrationMode = this.serverConfig.get().server.registrationMode;
+    const accessRequest = this.repos.accessRequests.get(server.id, user.id);
+    if (registrationMode !== 'open_signup' && accessRequest?.status !== 'approved') {
+      return user;
+    }
+
+    return grantDefaultMemberRole(this.repos, {
+      serverId: server.id,
+      userId: user.id,
+    }).user ?? user;
   }
 
   logout(sessionToken?: string): void {
@@ -529,7 +562,9 @@ export class AuthService {
       try {
         const profileUrl = new URL(endpoint);
         profileUrl.searchParams.set('actor', actor);
-        const profileResponse = await fetch(profileUrl);
+        const profileResponse = await fetch(profileUrl, {
+          signal: AbortSignal.timeout(PROFILE_FETCH_TIMEOUT_MS),
+        });
         if (!profileResponse.ok) {
           continue;
         }
@@ -542,12 +577,14 @@ export class AuthService {
             : undefined;
         const avatar =
           typeof payload.avatar === 'string' && payload.avatar.trim().length > 0 ? payload.avatar : undefined;
+        const description = typeof payload.description === 'string' ? payload.description.trim() : '';
 
         return {
           did: payload.did ?? actor,
           handle,
           displayName,
           avatar,
+          description,
         };
       } catch {
         continue;

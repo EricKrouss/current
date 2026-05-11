@@ -144,12 +144,28 @@ export class InMemoryVoiceSfuAdapter implements VoiceSfuAdapter {
   }
 
   async resumeConsumer(input: { sessionId: string; consumerId: string }): Promise<void> {
-    const session = this.requireSession(input.sessionId);
-    const consumer = session.consumers.get(input.consumerId);
+    const consumer = await this.setConsumerPaused({
+      ...input,
+      paused: false,
+    });
     if (!consumer) {
       throw new Error('Voice consumer not found.');
     }
-    session.consumers.set(consumer.id, { ...consumer, paused: false });
+  }
+
+  async setConsumerPaused(input: {
+    sessionId: string;
+    consumerId: string;
+    paused: boolean;
+  }): Promise<VoiceConsumerInfo | null> {
+    const session = this.requireSession(input.sessionId);
+    const consumer = session.consumers.get(input.consumerId);
+    if (!consumer) {
+      return null;
+    }
+    const next = { ...consumer, paused: input.paused };
+    session.consumers.set(consumer.id, next);
+    return next;
   }
 
   async closeSession(sessionId: string): Promise<VoiceSessionCloseResult | null> {

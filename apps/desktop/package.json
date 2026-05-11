@@ -13,7 +13,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "electron": "^38.4.0"
+    "electron": "^39.8.10"
   },
   "devDependencies": {
     "tsx": "^4.20.6",

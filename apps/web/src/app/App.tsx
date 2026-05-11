@@ -24,13 +24,16 @@ import type {
   Channel,
   Message,
   PageResponse,
+  ServerAccess,
+  ServerAccessRequest,
+  ServerAccessState,
   ServerAppearance,
   UserPresence,
   UserPresenceDisplayStatus,
   UserPresenceStatus,
   VoiceState,
 } from '@current/types';
-import { apiDelete, apiGet, apiPatch, apiPost, apiPut, uploadAttachment } from '../lib/api';
+import { ApiRequestError, apiDelete, apiGet, apiPatch, apiPost, apiPut, uploadAttachment } from '../lib/api';
 import {
   decryptMessageContent,
   encryptMessageContent,
@@ -59,6 +62,11 @@ import {
 } from './emoji-skin-tones';
 
 const CURRENT_LOGO_URL = new URL('../../../../assets/logo_grayscale.svg', import.meta.url).href;
+const MESSAGE_NOTIFICATION_URL = new URL('../../../../assets/audio/message/notification.mp3', import.meta.url).href;
+const VOICE_CONNECT_URL = new URL('../../../../assets/audio/voice/voice_connect.mp3', import.meta.url).href;
+const VOICE_LEAVE_URL = new URL('../../../../assets/audio/voice/voice_leave.mp3', import.meta.url).href;
+const MICROPHONE_ICON_URL = new URL('../../../../assets/microphone_icon/microphone.svg', import.meta.url).href;
+const MICROPHONE_MUTED_ICON_URL = new URL('../../../../assets/microphone_icon/microphone_muted.svg', import.meta.url).href;
 
 type AuthMode = 'atproto' | 'lan';
 type RegistrationMode = 'invite_only' | 'open_signup' | 'manual_approval';
@@ -73,12 +81,51 @@ type CurrentDesktopAppearancePayload = {
   resolvedMode: ResolvedAppearanceMode;
 };
 
-type CurrentDesktopAppearanceRuntime = {
-  getAppearanceMode?: () => Promise<CurrentDesktopAppearancePayload>;
-  onAppearanceModeChange?: (callback: (payload: CurrentDesktopAppearancePayload) => void) => () => void;
+type CurrentDesktopPushToTalkMode = 'voice_activity' | 'hold' | 'toggle';
+
+type CurrentDesktopSoundSettings = {
+  inputDeviceId: string;
+  outputDeviceId: string;
+  outputVolume: number;
+  noiseSuppression: boolean;
+  echoCancellation: boolean;
+  autoGainControl: boolean;
+  pushToTalkMode: CurrentDesktopPushToTalkMode;
+  pushToTalkKey: string;
 };
 
+type CurrentDesktopRuntime = {
+  host?: string;
+  platform?: string;
+  getAppearanceMode?: () => Promise<CurrentDesktopAppearancePayload>;
+  onAppearanceModeChange?: (callback: (payload: CurrentDesktopAppearancePayload) => void) => () => void;
+  getSoundSettings?: () => Promise<CurrentDesktopSoundSettings>;
+  onSoundSettingsChange?: (callback: (payload: CurrentDesktopSoundSettings) => void) => () => void;
+};
+
+type CurrentGaiaVoiceState = {
+  connected: boolean;
+  channelId?: string;
+  status?: string;
+};
+
+declare global {
+  interface Window {
+    __CURRENT_GAIA_VOICE_STATE__?: CurrentGaiaVoiceState;
+  }
+}
+
 const APPEARANCE_TRANSITION_MS = 680;
+const DEFAULT_DESKTOP_SOUND_SETTINGS: CurrentDesktopSoundSettings = {
+  inputDeviceId: 'default',
+  outputDeviceId: 'default',
+  outputVolume: 1,
+  noiseSuppression: true,
+  echoCancellation: true,
+  autoGainControl: true,
+  pushToTalkMode: 'hold',
+  pushToTalkKey: 'Space',
+};
 
 type SetupStatus = {
   configured: boolean;
@@ -98,6 +145,7 @@ type SessionPayload = {
     handle: string;
     displayName: string;
     avatarUrl?: string;
+    bio?: string;
     roleIds: string[];
   };
   server: {
@@ -108,10 +156,12 @@ type SessionPayload = {
   ownership?: {
     ownerUserId?: string;
   };
+  access?: ServerAccess;
 };
 
 type OAuthLanHandoffPayload = {
   handoffId: string;
+  claimToken: string;
   hostAuthUrl: string;
   expiresAt: string;
   message?: string;
@@ -133,8 +183,26 @@ type MemberPayload = {
   handle: string;
   displayName: string;
   avatarUrl?: string;
+  bio?: string;
   roleIds: string[];
   createdAt: string;
+};
+
+type MessageAuthorDisplay = SessionPayload['user'] | MemberPayload | NonNullable<Message['author']>;
+
+type MemberUpdateAction = 'join' | 'leave' | 'kick' | 'ban' | 'role_update';
+
+type MemberUpdateGatewayPayload = {
+  action?: MemberUpdateAction;
+  userId?: string;
+  member?: MemberPayload;
+  reason?: string;
+};
+
+type ServerRemovalNotice = {
+  type: 'kick' | 'ban';
+  message: string;
+  reason?: string;
 };
 
 type RolePayload = {
@@ -261,6 +329,12 @@ type EmojiTonePickerState = {
   group: EmojiToneGroup;
   x: number;
   y: number;
+} | null;
+
+type MemberProfilePopoverState = {
+  memberId: string;
+  left: number;
+  top: number;
 } | null;
 
 type MessageToolbarPlacement = 'top' | 'bottom';
@@ -601,6 +675,9 @@ const MEMBERS_PAGE_LIMIT = 100;
 const PAGE_SCROLL_THRESHOLD_PX = 120;
 const MESSAGE_BOTTOM_THRESHOLD_PX = 96;
 const MESSAGE_HOVER_TOOLBAR_MIN_TOP_SPACE = 44;
+const MEMBER_PROFILE_POPOUT_WIDTH = 304;
+const MEMBER_PROFILE_POPOUT_ESTIMATED_HEIGHT = 244;
+const MEMBER_PROFILE_POPOUT_GAP = 12;
 const TYPING_IDLE_MS = 4_500;
 const TYPING_HEARTBEAT_MS = 2_200;
 const TYPING_TTL_MS = 5_200;
@@ -608,6 +685,7 @@ const RECENT_REACTION_STORAGE_KEY = 'current.recentReactionEmojis';
 const EMOJI_TONE_DEFAULTS_STORAGE_KEY = 'current.emojiToneDefaults';
 const CHANNELS_PANE_WIDTH_STORAGE_KEY = 'current.channelsPaneWidth';
 const MEMBERS_PANE_WIDTH_STORAGE_KEY = 'current.membersPaneWidth';
+const SERVER_REMOVAL_NOTICE_STORAGE_KEY = 'current.serverRemovalNotice';
 const EMOJI_LONG_PRESS_MS = 450;
 const DEFAULT_RECENT_REACTION_EMOJIS = ['👍', '❤️', '😂'];
 const DEFAULT_CHANNELS_PANE_WIDTH = 260;
@@ -623,6 +701,87 @@ const PRESENCE_STATUS_OPTIONS: Array<{ value: UserPresenceStatus; label: string 
   { value: 'dnd', label: 'Do Not Disturb' },
   { value: 'invisible', label: 'Invisible' },
 ];
+
+function buildServerRemovalNotice(type: 'kick' | 'ban', reason?: string): ServerRemovalNotice {
+  return {
+    type,
+    message: type === 'ban' ? "You've been banned" : "You've been kicked",
+    reason: reason?.trim() || undefined,
+  };
+}
+
+function parseServerRemovalNotice(value: unknown): ServerRemovalNotice | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const notice = value as Partial<ServerRemovalNotice>;
+  if (notice.type !== 'kick' && notice.type !== 'ban') {
+    return null;
+  }
+
+  return buildServerRemovalNotice(
+    notice.type,
+    typeof notice.reason === 'string' ? notice.reason : undefined,
+  );
+}
+
+function loadServerRemovalNotice(): ServerRemovalNotice | null {
+  try {
+    const stored = window.localStorage.getItem(SERVER_REMOVAL_NOTICE_STORAGE_KEY);
+    return stored ? parseServerRemovalNotice(JSON.parse(stored)) : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeServerRemovalNotice(notice: ServerRemovalNotice): void {
+  try {
+    window.localStorage.setItem(SERVER_REMOVAL_NOTICE_STORAGE_KEY, JSON.stringify(notice));
+  } catch {
+    // Removal notices are best-effort UI state; the server remains authoritative.
+  }
+}
+
+function clearStoredServerRemovalNotice(): void {
+  try {
+    window.localStorage.removeItem(SERVER_REMOVAL_NOTICE_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function getServerRemovalNoticeFromError(error: unknown): ServerRemovalNotice | null {
+  if (!(error instanceof ApiRequestError)) {
+    return null;
+  }
+  if (error.code === 'SERVER_BANNED') {
+    return buildServerRemovalNotice('ban', error.reason);
+  }
+  if (error.code === 'SERVER_KICKED') {
+    return buildServerRemovalNotice('kick', error.reason);
+  }
+  return null;
+}
+
+function getServerRemovalNoticeFromCloseReason(reason: unknown): ServerRemovalNotice | null {
+  if (typeof reason !== 'string') {
+    return null;
+  }
+
+  const trimmed = reason.trim();
+  for (const type of ['kick', 'ban'] as const) {
+    const prefix = type === 'ban' ? "You've been banned" : "You've been kicked";
+    if (trimmed === prefix) {
+      return buildServerRemovalNotice(type);
+    }
+    if (trimmed.startsWith(`${prefix}:`)) {
+      return buildServerRemovalNotice(type, trimmed.slice(prefix.length + 1));
+    }
+  }
+
+  return null;
+}
 
 type TypingUpdateEventPayload = {
   channelId?: string;
@@ -671,8 +830,148 @@ function cssImageUrl(url?: string): string | undefined {
   return url ? `url("${url.replace(/"/g, '\\"')}")` : undefined;
 }
 
-function currentDesktopAppearanceRuntime(): CurrentDesktopAppearanceRuntime | undefined {
-  return (window as Window & { currentDesktop?: CurrentDesktopAppearanceRuntime }).currentDesktop;
+function currentDesktopRuntime(): CurrentDesktopRuntime | undefined {
+  return (window as Window & { currentDesktop?: CurrentDesktopRuntime }).currentDesktop;
+}
+
+function shouldLogAudioDiagnostics(): boolean {
+  const runtime = currentDesktopRuntime();
+  return runtime?.host === 'gaia-launcher' || new URLSearchParams(window.location.search).has('current_audio_debug');
+}
+
+function audioErrorDetails(error: MediaError | null): Record<string, unknown> | null {
+  return error
+    ? {
+        code: error.code,
+        message: error.message,
+      }
+    : null;
+}
+
+function audioUserActivationDetails(): Record<string, unknown> | null {
+  const userActivation = navigator.userActivation;
+  return userActivation
+    ? {
+        hasBeenActive: userActivation.hasBeenActive,
+        isActive: userActivation.isActive,
+      }
+    : null;
+}
+
+function audioElementDetails(audio: HTMLAudioElement | null): Record<string, unknown> | null {
+  return audio
+    ? {
+        src: audio.src,
+        currentSrc: audio.currentSrc,
+        readyState: audio.readyState,
+        networkState: audio.networkState,
+        paused: audio.paused,
+        muted: audio.muted,
+        volume: audio.volume,
+        currentTime: audio.currentTime,
+        duration: Number.isFinite(audio.duration) ? audio.duration : String(audio.duration),
+        error: audioErrorDetails(audio.error),
+      }
+    : null;
+}
+
+function logAudioDiagnostic(message: string, details: Record<string, unknown> = {}): void {
+  if (!shouldLogAudioDiagnostics()) {
+    return;
+  }
+
+  const payload = {
+    ...details,
+    href: window.location.href,
+    visibilityState: document.visibilityState,
+    documentHidden: document.hidden,
+    userActivation: audioUserActivationDetails(),
+    runtimeHost: currentDesktopRuntime()?.host ?? null,
+  };
+  let serialized = '';
+  try {
+    serialized = ` ${JSON.stringify(payload)}`;
+  } catch {
+    serialized = '';
+  }
+
+  console.info(`[Current audio] ${message}${serialized}`);
+}
+
+function isGaiaLauncherRuntime(): boolean {
+  const runtime = currentDesktopRuntime();
+  return Boolean(
+    runtime?.getAppearanceMode ||
+      runtime?.onAppearanceModeChange ||
+      runtime?.getSoundSettings ||
+      runtime?.onSoundSettingsChange,
+  );
+}
+
+function isApprovedServerAccess(access?: ServerAccess): boolean {
+  return !access || access.state === 'approved';
+}
+
+function isWaitingForServerAccess(access?: ServerAccess): boolean {
+  return Boolean(
+    access &&
+      (access.state === 'pending' ||
+        access.state === 'not_requested' ||
+        access.state === 'invite_required'),
+  );
+}
+
+async function resolveWaitlistNotificationPreference(): Promise<{
+  notificationsEnabled: boolean;
+  source: 'browser' | 'gaia_launcher';
+}> {
+  if (isGaiaLauncherRuntime()) {
+    return {
+      notificationsEnabled: true,
+      source: 'gaia_launcher',
+    };
+  }
+
+  if (!('Notification' in window)) {
+    return {
+      notificationsEnabled: false,
+      source: 'browser',
+    };
+  }
+
+  if (Notification.permission === 'granted') {
+    return {
+      notificationsEnabled: true,
+      source: 'browser',
+    };
+  }
+
+  if (Notification.permission === 'denied') {
+    return {
+      notificationsEnabled: false,
+      source: 'browser',
+    };
+  }
+
+  const permission = await Notification.requestPermission();
+  return {
+    notificationsEnabled: permission === 'granted',
+    source: 'browser',
+  };
+}
+
+function showWaitlistAcceptedNotification(serverName?: string): void {
+  if (!('Notification' in window) || Notification.permission !== 'granted') {
+    return;
+  }
+
+  try {
+    new Notification('You are in', {
+      body: `${serverName ?? 'Current'} approved your request.`,
+    });
+  } catch {
+    // Notification display is best-effort.
+  }
 }
 
 function resolveSystemAppearanceMode(): ResolvedAppearanceMode {
@@ -690,6 +989,70 @@ function normalizeAppearanceModePayload(
         ? resolveSystemAppearanceMode()
         : mode;
   return { mode, resolvedMode };
+}
+
+function normalizeDesktopSoundSettings(
+  payload?: Partial<CurrentDesktopSoundSettings> | null,
+): CurrentDesktopSoundSettings {
+  const outputVolume =
+    typeof payload?.outputVolume === 'number' && Number.isFinite(payload.outputVolume)
+      ? Math.min(1, Math.max(0, payload.outputVolume))
+      : DEFAULT_DESKTOP_SOUND_SETTINGS.outputVolume;
+  const pushToTalkMode =
+    payload?.pushToTalkMode === 'voice_activity' || payload?.pushToTalkMode === 'hold' || payload?.pushToTalkMode === 'toggle'
+      ? payload.pushToTalkMode
+      : DEFAULT_DESKTOP_SOUND_SETTINGS.pushToTalkMode;
+  const pushToTalkKey =
+    typeof payload?.pushToTalkKey === 'string' && payload.pushToTalkKey.trim()
+      ? payload.pushToTalkKey.trim()
+      : DEFAULT_DESKTOP_SOUND_SETTINGS.pushToTalkKey;
+
+  return {
+    inputDeviceId:
+      typeof payload?.inputDeviceId === 'string' && payload.inputDeviceId.trim()
+        ? payload.inputDeviceId
+        : DEFAULT_DESKTOP_SOUND_SETTINGS.inputDeviceId,
+    outputDeviceId:
+      typeof payload?.outputDeviceId === 'string' && payload.outputDeviceId.trim()
+        ? payload.outputDeviceId
+        : DEFAULT_DESKTOP_SOUND_SETTINGS.outputDeviceId,
+    outputVolume,
+    noiseSuppression:
+      typeof payload?.noiseSuppression === 'boolean'
+        ? payload.noiseSuppression
+        : DEFAULT_DESKTOP_SOUND_SETTINGS.noiseSuppression,
+    echoCancellation:
+      typeof payload?.echoCancellation === 'boolean'
+        ? payload.echoCancellation
+        : DEFAULT_DESKTOP_SOUND_SETTINGS.echoCancellation,
+    autoGainControl:
+      typeof payload?.autoGainControl === 'boolean'
+        ? payload.autoGainControl
+        : DEFAULT_DESKTOP_SOUND_SETTINGS.autoGainControl,
+    pushToTalkMode,
+    pushToTalkKey,
+  };
+}
+
+function keybindMatchesKeyboardEvent(keybind: string, event: KeyboardEvent): boolean {
+  const code = event.code || event.key;
+  if (!code) {
+    return false;
+  }
+
+  const parts = keybind.split('+').filter(Boolean);
+  const expectedKey = parts[parts.length - 1];
+  if (!expectedKey || expectedKey !== code) {
+    return false;
+  }
+
+  const modifiers = new Set(parts.slice(0, -1));
+  return (
+    event.ctrlKey === modifiers.has('Ctrl') &&
+    event.altKey === modifiers.has('Alt') &&
+    event.shiftKey === modifiers.has('Shift') &&
+    event.metaKey === modifiers.has('Meta')
+  );
 }
 
 function isBrightImageData(imageData: ImageData): boolean {
@@ -998,6 +1361,29 @@ function formatIdentityHandle(user: { did: string; handle: string } | null | und
   return isLanIdentity(user) ? '@LAN' : `@${user.handle}`;
 }
 
+function getMessageAuthor(
+  message: Message | null | undefined,
+  membersById: ReadonlyMap<string, MessageAuthorDisplay>,
+): MessageAuthorDisplay | null {
+  if (!message) {
+    return null;
+  }
+  return membersById.get(message.authorId) ?? message.author ?? null;
+}
+
+function getBlueskyProfileUrl(user: { did: string; handle: string } | null | undefined): string | null {
+  if (!user || isLanIdentity(user)) {
+    return null;
+  }
+
+  const profileId = user.handle.trim() || user.did.trim();
+  return profileId ? `https://bsky.app/profile/${encodeURIComponent(profileId)}` : null;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
 function getMemberCreatedAtTimestamp(member: SessionPayload['user'] | MemberPayload): number {
   if ('createdAt' in member && typeof member.createdAt === 'string') {
     const value = Date.parse(member.createdAt);
@@ -1053,6 +1439,17 @@ function normalizeReferenceToken(value: string): string {
 
 function getMemberMentionToken(member: SessionPayload['user'] | MemberPayload): string {
   return `@${member.handle}`;
+}
+
+function extractNotificationMentionHandles(content: string): string[] {
+  const handles = new Set<string>();
+  for (const match of content.matchAll(/@[A-Za-z0-9._-]+/g)) {
+    const handle = normalizeReferenceToken(match[0].slice(1));
+    if (handle) {
+      handles.add(handle);
+    }
+  }
+  return [...handles];
 }
 
 function getChannelMentionToken(channel: Channel): string {
@@ -1173,6 +1570,29 @@ function EmojiPickerIcon() {
   );
 }
 
+function JoinRequestsIcon() {
+  return (
+    <svg className="channels-access-requests-icon" viewBox="0 0 24 24" aria-hidden focusable="false">
+      <circle cx="9" cy="8" r="3.25" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <path
+        d="M3.75 18.25c.7-2.75 2.55-4.1 5.25-4.1s4.55 1.35 5.25 4.1"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+      <path
+        d="M18.25 7.25v5.5M21 10h-5.5"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
+}
+
 function renderMessageContent(
   content: string,
   options: {
@@ -1241,9 +1661,13 @@ function renderMessageContent(
 function RemoteVoiceAudio({
   remote,
   muted,
+  outputDeviceId,
+  volume,
 }: {
   remote: VoiceRemoteStream;
   muted: boolean;
+  outputDeviceId: string;
+  volume: number;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -1252,6 +1676,22 @@ function RemoteVoiceAudio({
       audioRef.current.srcObject = remote.stream;
     }
   }, [remote.stream]);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) {
+      return;
+    }
+    audio.volume = Math.min(1, Math.max(0, volume));
+  }, [volume]);
+
+  useEffect(() => {
+    const audio = audioRef.current as (HTMLAudioElement & { setSinkId?: (sinkId: string) => Promise<void> }) | null;
+    if (!audio?.setSinkId) {
+      return;
+    }
+    void audio.setSinkId(outputDeviceId === 'default' ? '' : outputDeviceId).catch(() => undefined);
+  }, [outputDeviceId]);
 
   return <audio ref={audioRef} autoPlay playsInline muted={muted} />;
 }
@@ -1270,6 +1710,7 @@ function VoiceMicMeter({
     Math.max(0.12, Math.min(1, displayedLevel / threshold)),
   );
   const percentage = Math.round(displayedLevel * 100);
+  const microphoneIconUrl = disabled ? MICROPHONE_MUTED_ICON_URL : MICROPHONE_ICON_URL;
 
   return (
     <div
@@ -1285,8 +1726,7 @@ function VoiceMicMeter({
     >
       <span className="voice-mic-icon" aria-hidden="true">
         <span className="voice-mic-glow" />
-        <span className="voice-mic-capsule" />
-        <span className="voice-mic-stand" />
+        <img className="voice-mic-image" src={microphoneIconUrl} alt="" draggable={false} decoding="async" />
       </span>
       <span className="voice-mic-bars" aria-hidden="true">
         {barScales.map((scale, index) => (
@@ -1345,7 +1785,11 @@ export function App() {
   const [searchFromUserId, setSearchFromUserId] = useState<'all' | string>('all');
   const [searchChannelId, setSearchChannelId] = useState<'all' | string>('all');
   const [isExchangingAuth, setIsExchangingAuth] = useState(false);
+  const [serverRemovalNotice, setServerRemovalNotice] = useState<ServerRemovalNotice | null>(() =>
+    loadServerRemovalNotice(),
+  );
   const [isServerSettingsOpen, setIsServerSettingsOpen] = useState(false);
+  const [isAccessRequestsOpen, setIsAccessRequestsOpen] = useState(false);
   const [appearancePreview, setAppearancePreview] = useState<ServerAppearance | null>(null);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const [highlightedMemberId, setHighlightedMemberId] = useState<string | null>(null);
@@ -1395,6 +1839,7 @@ export function App() {
   const [presenceByUserId, setPresenceByUserId] = useState<Record<string, UserPresence>>({});
   const [selfPresenceStatus, setSelfPresenceStatus] = useState<UserPresenceStatus>('online');
   const [isPresenceMenuOpen, setIsPresenceMenuOpen] = useState(false);
+  const [memberProfilePopover, setMemberProfilePopover] = useState<MemberProfilePopoverState>(null);
   const [voiceSpeakingUserIds, setVoiceSpeakingUserIds] = useState<Set<string>>(() => new Set());
   const [pushToTalkHeld, setPushToTalkHeld] = useState(false);
   const [channelsPaneWidth, setChannelsPaneWidth] = useState(loadChannelsPaneWidth);
@@ -1406,6 +1851,10 @@ export function App() {
   const [resolvedAppearanceMode, setResolvedAppearanceMode] = useState<ResolvedAppearanceMode>(() =>
     resolveSystemAppearanceMode(),
   );
+  const [desktopSoundSettings, setDesktopSoundSettings] = useState<CurrentDesktopSoundSettings>(
+    DEFAULT_DESKTOP_SOUND_SETTINGS,
+  );
+  const [desktopSoundSettingsControlled, setDesktopSoundSettingsControlled] = useState(false);
   const [appearanceTransition, setAppearanceTransition] = useState<{
     id: number;
     from: ResolvedAppearanceMode;
@@ -1418,6 +1867,7 @@ export function App() {
     placement: MessageToolbarPlacement;
   } | null>(null);
   const typingChannelRef = useRef<string | null>(null);
+  const previousAccessStateRef = useRef<ServerAccessState | null>(null);
   const typingStopTimerRef = useRef<number | null>(null);
   const typingHeartbeatAtRef = useRef(0);
   const emojiLongPressTimerRef = useRef<number | null>(null);
@@ -1428,6 +1878,7 @@ export function App() {
   const channelsPaneRef = useRef<HTMLElement | null>(null);
   const channelsListRef = useRef<HTMLDivElement | null>(null);
   const membersPaneRef = useRef<HTMLElement | null>(null);
+  const knownMemberIdsRef = useRef<Set<string>>(new Set());
   const channelTitleGlassRef = useRef<HTMLDivElement | null>(null);
   const profileGlassRef = useRef<HTMLElement | null>(null);
   const presenceMenuRef = useRef<HTMLDivElement | null>(null);
@@ -1436,6 +1887,16 @@ export function App() {
   const newMessageJumpRef = useRef<HTMLButtonElement | null>(null);
   const resolvedAppearanceModeRef = useRef(resolvedAppearanceMode);
   const appearanceTransitionTimerRef = useRef<number | null>(null);
+  const incomingMessageAudioRef = useRef<HTMLAudioElement | null>(null);
+  const voiceConnectAudioRef = useRef<HTMLAudioElement | null>(null);
+  const voiceLeaveAudioRef = useRef<HTMLAudioElement | null>(null);
+  const appAudioUnlockedRef = useRef(false);
+  const voicePresenceByUserIdRef = useRef<Map<string, VoiceState>>(new Map());
+
+  const clearServerRemovalNotice = useCallback(() => {
+    clearStoredServerRemovalNotice();
+    setServerRemovalNotice(null);
+  }, []);
   const prependScrollAnchorRef = useRef<{ channelId: string; scrollHeight: number; scrollTop: number } | null>(null);
   const initialBottomScrollChannelIdRef = useRef<string | null>(null);
   const messagesAtBottomRef = useRef(true);
@@ -1712,7 +2173,7 @@ export function App() {
       setAppearanceMode(normalized.mode);
       setResolvedAppearanceMode(normalized.resolvedMode);
     };
-    const runtime = currentDesktopAppearanceRuntime();
+    const runtime = currentDesktopRuntime();
     const hasGaiaAppearanceRuntime = Boolean(runtime?.getAppearanceMode || runtime?.onAppearanceModeChange);
     let disposeGaiaListener: (() => void) | undefined;
 
@@ -1759,6 +2220,267 @@ export function App() {
   }, [playAppearanceTransition]);
 
   useEffect(() => {
+    let cancelled = false;
+    const runtime = currentDesktopRuntime();
+    const hasSoundRuntime = Boolean(runtime?.getSoundSettings || runtime?.onSoundSettingsChange);
+    let disposeGaiaListener: (() => void) | undefined;
+
+    setDesktopSoundSettingsControlled(hasSoundRuntime);
+
+    if (runtime?.getSoundSettings) {
+      void runtime.getSoundSettings().then((payload) => {
+        if (!cancelled) {
+          setDesktopSoundSettings(normalizeDesktopSoundSettings(payload));
+        }
+      }).catch(() => {
+        if (!cancelled) {
+          setDesktopSoundSettings(DEFAULT_DESKTOP_SOUND_SETTINGS);
+        }
+      });
+    }
+
+    if (runtime?.onSoundSettingsChange) {
+      disposeGaiaListener = runtime.onSoundSettingsChange((payload) => {
+        if (!cancelled) {
+          setDesktopSoundSettings(normalizeDesktopSoundSettings(payload));
+        }
+      });
+    }
+
+    if (!hasSoundRuntime) {
+      setDesktopSoundSettings(DEFAULT_DESKTOP_SOUND_SETTINGS);
+    }
+
+    return () => {
+      cancelled = true;
+      disposeGaiaListener?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    const audioEvents = [
+      'loadstart',
+      'loadedmetadata',
+      'loadeddata',
+      'canplay',
+      'canplaythrough',
+      'playing',
+      'pause',
+      'stalled',
+      'suspend',
+      'waiting',
+      'error',
+      'abort',
+      'emptied',
+    ];
+    const createAudio = (label: string, src: string) => {
+      const audio = document.createElement('audio');
+      audio.preload = 'auto';
+      audio.src = src;
+      audio.volume = DEFAULT_DESKTOP_SOUND_SETTINGS.outputVolume;
+      audio.style.display = 'none';
+      for (const eventName of audioEvents) {
+        audio.addEventListener(eventName, () => {
+          logAudioDiagnostic(`${label}:${eventName}`, {
+            audio: audioElementDetails(audio),
+          });
+        });
+      }
+      logAudioDiagnostic(`${label}:create`, {
+        src,
+        canPlayMp3: audio.canPlayType('audio/mpeg'),
+        canPlayMpeg: audio.canPlayType('audio/mp3'),
+        audio: audioElementDetails(audio),
+      });
+      void fetch(src, { method: 'HEAD', cache: 'no-store' })
+        .then((response) => {
+          logAudioDiagnostic(`${label}:head`, {
+            src,
+            ok: response.ok,
+            status: response.status,
+            statusText: response.statusText,
+            url: response.url,
+            contentType: response.headers.get('content-type'),
+            contentLength: response.headers.get('content-length'),
+          });
+        })
+        .catch((error: unknown) => {
+          logAudioDiagnostic(`${label}:head-failed`, {
+            src,
+            errorName: error instanceof Error ? error.name : typeof error,
+            errorMessage: error instanceof Error ? error.message : String(error),
+          });
+        });
+      audio.load();
+      document.body.append(audio);
+      return audio;
+    };
+    const messageAudio = createAudio('message', MESSAGE_NOTIFICATION_URL);
+    const voiceConnectAudio = createAudio('voice_connect', VOICE_CONNECT_URL);
+    const voiceLeaveAudio = createAudio('voice_leave', VOICE_LEAVE_URL);
+    const appAudios = [messageAudio, voiceConnectAudio, voiceLeaveAudio];
+    incomingMessageAudioRef.current = messageAudio;
+    voiceConnectAudioRef.current = voiceConnectAudio;
+    voiceLeaveAudioRef.current = voiceLeaveAudio;
+
+    const resetAudio = (audio: HTMLAudioElement) => {
+      audio.pause();
+      try {
+        audio.currentTime = 0;
+      } catch {
+        // Some browsers reject currentTime changes before metadata is ready.
+      }
+    };
+
+    const unlockAudio = () => {
+      if (appAudioUnlockedRef.current) {
+        logAudioDiagnostic('unlock:skip-already-unlocked');
+        return;
+      }
+
+      logAudioDiagnostic('unlock:start', {
+        audios: appAudios.map((audio) => audioElementDetails(audio)),
+      });
+      for (const audio of appAudios) {
+        audio.muted = true;
+      }
+      void Promise.allSettled(appAudios.map((audio) => audio.play())).then((results) => {
+        for (const audio of appAudios) {
+          resetAudio(audio);
+          audio.muted = false;
+        }
+        appAudioUnlockedRef.current = true;
+        logAudioDiagnostic('unlock:finished', {
+          results: results.map((result) =>
+            result.status === 'fulfilled'
+              ? { status: result.status }
+              : {
+                  status: result.status,
+                  reasonName: result.reason instanceof Error ? result.reason.name : typeof result.reason,
+                  reasonMessage: result.reason instanceof Error ? result.reason.message : String(result.reason),
+                },
+          ),
+          audios: appAudios.map((audio) => audioElementDetails(audio)),
+        });
+      });
+    };
+
+    window.addEventListener('pointerdown', unlockAudio, { passive: true });
+    window.addEventListener('keydown', unlockAudio);
+
+    return () => {
+      window.removeEventListener('pointerdown', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+      for (const audio of appAudios) {
+        resetAudio(audio);
+        audio.remove();
+      }
+      if (incomingMessageAudioRef.current === messageAudio) {
+        incomingMessageAudioRef.current = null;
+      }
+      if (voiceConnectAudioRef.current === voiceConnectAudio) {
+        voiceConnectAudioRef.current = null;
+      }
+      if (voiceLeaveAudioRef.current === voiceLeaveAudio) {
+        voiceLeaveAudioRef.current = null;
+      }
+      appAudioUnlockedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const volume = clampNumber(desktopSoundSettings.outputVolume, 0, 1);
+    logAudioDiagnostic('settings:volume', { volume });
+    for (const audio of [
+      incomingMessageAudioRef.current,
+      voiceConnectAudioRef.current,
+      voiceLeaveAudioRef.current,
+    ]) {
+      if (audio) {
+        audio.volume = volume;
+      }
+    }
+  }, [desktopSoundSettings.outputVolume]);
+
+  useEffect(() => {
+    const sinkId = desktopSoundSettings.outputDeviceId === 'default' ? '' : desktopSoundSettings.outputDeviceId;
+    logAudioDiagnostic('settings:output-device', {
+      outputDeviceId: desktopSoundSettings.outputDeviceId,
+      sinkId,
+    });
+    for (const audio of [
+      incomingMessageAudioRef.current,
+      voiceConnectAudioRef.current,
+      voiceLeaveAudioRef.current,
+    ] as Array<(HTMLAudioElement & { setSinkId?: (sinkId: string) => Promise<void> }) | null>) {
+      if (audio?.setSinkId) {
+        void audio.setSinkId(sinkId)
+          .then(() => {
+            logAudioDiagnostic('settings:output-device-applied', {
+              sinkId,
+              audio: audioElementDetails(audio),
+            });
+          })
+          .catch((error: unknown) => {
+            logAudioDiagnostic('settings:output-device-failed', {
+              sinkId,
+              errorName: error instanceof Error ? error.name : typeof error,
+              errorMessage: error instanceof Error ? error.message : String(error),
+              audio: audioElementDetails(audio),
+            });
+          });
+      }
+    }
+  }, [desktopSoundSettings.outputDeviceId]);
+
+  const playAppAudio = useCallback((label: string, audio: HTMLAudioElement | null) => {
+    if (!audio) {
+      logAudioDiagnostic(`${label}:play-missing-audio`);
+      return;
+    }
+
+    logAudioDiagnostic(`${label}:play-request`, {
+      audio: audioElementDetails(audio),
+    });
+    audio.pause();
+    try {
+      audio.currentTime = 0;
+    } catch {
+      // Playback can still continue even if the browser ignores the seek.
+    }
+    audio.volume = clampNumber(desktopSoundSettings.outputVolume, 0, 1);
+    const playPromise = audio.play();
+    void playPromise
+      .then(() => {
+        logAudioDiagnostic(`${label}:play-resolved`, {
+          audio: audioElementDetails(audio),
+        });
+      })
+      .catch((error: unknown) => {
+        logAudioDiagnostic(`${label}:play-rejected`, {
+          errorName: error instanceof Error ? error.name : typeof error,
+          errorMessage: error instanceof Error ? error.message : String(error),
+          audio: audioElementDetails(audio),
+        });
+      });
+  }, [desktopSoundSettings.outputVolume]);
+
+  const playIncomingMessageNotification = useCallback(() => {
+    logAudioDiagnostic('message:notification-requested');
+    playAppAudio('message', incomingMessageAudioRef.current);
+  }, [playAppAudio]);
+
+  const playVoiceConnectSound = useCallback(() => {
+    logAudioDiagnostic('voice_connect:requested');
+    playAppAudio('voice_connect', voiceConnectAudioRef.current);
+  }, [playAppAudio]);
+
+  const playVoiceLeaveSound = useCallback(() => {
+    logAudioDiagnostic('voice_leave:requested');
+    playAppAudio('voice_leave', voiceLeaveAudioRef.current);
+  }, [playAppAudio]);
+
+  useEffect(() => {
     const current = new URL(window.location.href);
     const ticket = current.searchParams.get('current_auth_ticket');
     if (!ticket) {
@@ -1766,6 +2488,7 @@ export function App() {
     }
 
     setIsExchangingAuth(true);
+    clearServerRemovalNotice();
     void apiPost<void>('/api/v1/auth/exchange', { ticket })
       .then(() => {
         current.searchParams.delete('current_auth_ticket');
@@ -1774,7 +2497,7 @@ export function App() {
       .catch(() => {
         setIsExchangingAuth(false);
       });
-  }, []);
+  }, [clearServerRemovalNotice]);
 
   const setupQuery = useQuery({
     queryKey: ['setup-status'],
@@ -1787,9 +2510,55 @@ export function App() {
     queryFn: () => apiGet<SessionPayload>('/api/v1/auth/session'),
     enabled: Boolean(setupQuery.data),
     retry: false,
+    refetchInterval: (query) => (isWaitingForServerAccess(query.state.data?.access) ? 5_000 : false),
   });
-  const configuredUserReady = Boolean(setupQuery.data?.configured && sessionQuery.data?.user);
+  const configuredUserReady = Boolean(
+    setupQuery.data?.configured &&
+      sessionQuery.data?.user &&
+      isApprovedServerAccess(sessionQuery.data.access),
+  );
   const backgroundImageUrl = sessionQuery.data?.server.appearance?.background.url ?? '';
+
+  const joinWaitlistMutation = useMutation({
+    mutationFn: async () => {
+      const preference = await resolveWaitlistNotificationPreference();
+      return apiPost<{ access: ServerAccess }>('/api/v1/auth/waitlist', preference);
+    },
+    onSuccess: async () => {
+      await sessionQuery.refetch();
+    },
+  });
+
+  const claimInviteMutation = useMutation({
+    mutationFn: (code: string) => apiPost<{ access: ServerAccess; user: SessionPayload['user'] }>('/api/v1/auth/invite/claim', {
+      code,
+    }),
+    onSuccess: async () => {
+      await Promise.all([
+        sessionQuery.refetch(),
+        queryClient.invalidateQueries({ queryKey: ['members'] }),
+        queryClient.invalidateQueries({ queryKey: ['roles'] }),
+      ]);
+    },
+  });
+
+  useEffect(() => {
+    const notice = getServerRemovalNoticeFromError(sessionQuery.error);
+    if (!notice) {
+      return;
+    }
+    setServerRemovalNotice(notice);
+    storeServerRemovalNotice(notice);
+  }, [sessionQuery.error]);
+
+  useEffect(() => {
+    const state = sessionQuery.data?.access?.state ?? null;
+    const previous = previousAccessStateRef.current;
+    if (previous && previous !== 'approved' && state === 'approved') {
+      showWaitlistAcceptedNotification(sessionQuery.data?.server.name);
+    }
+    previousAccessStateRef.current = state;
+  }, [sessionQuery.data?.access?.state, sessionQuery.data?.server.name]);
 
   useEffect(() => {
     if (!backgroundImageUrl) {
@@ -2119,6 +2888,34 @@ export function App() {
     [membersQuery.data?.pages],
   );
 
+  const removeCachedMember = useCallback((userId: string) => {
+    queryClient.setQueryData<InfiniteData<PageResponse<MemberPayload>>>(['members'], (existing) => {
+      if (!existing) {
+        return existing;
+      }
+
+      let changed = false;
+      const pages = existing.pages.map((page) => {
+        const items = page.items.filter((item) => item.id !== userId);
+        if (items.length === page.items.length) {
+          return page;
+        }
+        changed = true;
+        return {
+          ...page,
+          items,
+        };
+      });
+
+      return changed
+        ? {
+            ...existing,
+            pages,
+          }
+        : existing;
+    });
+  }, [queryClient]);
+
   const handleChannelListScroll = useCallback(() => {
     if (!channelsQuery.hasNextPage || channelsQuery.isFetchingNextPage) {
       return;
@@ -2134,6 +2931,7 @@ export function App() {
   }, [channelsQuery]);
 
   const handleMembersPaneScroll = useCallback(() => {
+    setMemberProfilePopover(null);
     if (!membersQuery.hasNextPage || membersQuery.isFetchingNextPage) {
       return;
     }
@@ -2146,6 +2944,30 @@ export function App() {
       void membersQuery.fetchNextPage();
     }
   }, [membersQuery]);
+
+  const toggleMemberProfilePopover = useCallback((memberId: string, event: ReactMouseEvent<HTMLButtonElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setMemberProfilePopover((current) => {
+      if (current?.memberId === memberId) {
+        return null;
+      }
+
+      const preferredLeft = rect.left - MEMBER_PROFILE_POPOUT_WIDTH - MEMBER_PROFILE_POPOUT_GAP;
+      const fallbackLeft = rect.right + MEMBER_PROFILE_POPOUT_GAP;
+      const maxLeft = Math.max(12, window.innerWidth - MEMBER_PROFILE_POPOUT_WIDTH - 12);
+      const left = preferredLeft >= 12
+        ? preferredLeft
+        : clampNumber(fallbackLeft, 12, maxLeft);
+      const maxTop = Math.max(12, window.innerHeight - MEMBER_PROFILE_POPOUT_ESTIMATED_HEIGHT - 12);
+      const top = clampNumber(rect.top - 10, 12, maxTop);
+
+      return {
+        memberId,
+        left,
+        top,
+      };
+    });
+  }, []);
 
   useEffect(() => {
     if (!channelsQuery.hasNextPage || channelsQuery.isFetchingNextPage) {
@@ -2250,12 +3072,41 @@ export function App() {
     refetchInterval: 3_000,
   });
 
+  useEffect(() => {
+    voicePresenceByUserIdRef.current = new Map(
+      (voiceStateQuery.data ?? []).map((voiceState) => [voiceState.userId, voiceState]),
+    );
+  }, [voiceStateQuery.data]);
+
   const presenceQuery = useQuery({
     queryKey: ['presence'],
     queryFn: () => apiGet<PresenceResponse>('/api/v1/presence'),
     enabled: configuredUserReady,
     refetchInterval: 30_000,
   });
+
+  const updatePresenceCache = useCallback((presence: UserPresence, selfStatus?: UserPresenceStatus) => {
+    queryClient.setQueryData<PresenceResponse>(['presence'], (existing) => {
+      if (!existing) {
+        return existing;
+      }
+
+      let replaced = false;
+      const items = existing.items.map((item) => {
+        if (item.userId !== presence.userId) {
+          return item;
+        }
+        replaced = true;
+        return presence;
+      });
+
+      return {
+        ...existing,
+        items: replaced ? items : [...items, presence],
+        selfStatus: selfStatus ?? existing.selfStatus,
+      };
+    });
+  }, [queryClient]);
 
   useEffect(() => {
     if (!presenceQuery.data) {
@@ -2274,6 +3125,7 @@ export function App() {
 
   const voiceClient = useVoiceClient({
     currentUserId: sessionQuery.data?.user?.id,
+    audioSettings: desktopSoundSettings,
   });
   const voiceNetworkDiagnosticsLabel = useMemo(
     () => formatVoiceNetworkDiagnostics(voiceClient.diagnostics),
@@ -2283,8 +3135,61 @@ export function App() {
   const gatewayState = useGateway(configuredUserReady, useCallback((event) => {
     voiceClient.handleGatewayEvent(event);
 
+    if (event.type === 'GATEWAY_CLOSE') {
+      const payload = event.payload as { reason?: unknown };
+      const notice = getServerRemovalNoticeFromCloseReason(payload.reason);
+      if (notice) {
+        setServerRemovalNotice(notice);
+        storeServerRemovalNotice(notice);
+        void queryClient.invalidateQueries({ queryKey: ['session'] });
+      }
+      return;
+    }
+
+    if (event.type === 'READY') {
+      void queryClient.invalidateQueries({ queryKey: ['presence'] });
+      return;
+    }
+
     if (event.type === 'VOICE_STATE_UPDATE') {
+      const payload = event.payload as {
+        voiceState?: VoiceState | { userId?: string; channelId?: string | null };
+      };
+      const voiceState = payload.voiceState;
+      const userId = voiceState?.userId;
+      if (userId) {
+        const previousVoiceState = voicePresenceByUserIdRef.current.get(userId) ?? null;
+        const currentUserId = sessionQuery.data?.user?.id;
+        const isSelfUpdate = userId === currentUserId;
+        const selfVoiceStateBefore = currentUserId
+          ? voicePresenceByUserIdRef.current.get(currentUserId) ?? null
+          : null;
+        const joinedChannelId = typeof voiceState.channelId === 'string' ? voiceState.channelId : null;
+        const changedChannel = previousVoiceState?.channelId !== joinedChannelId;
+
+        if (joinedChannelId) {
+          if (changedChannel) {
+            if (isSelfUpdate || selfVoiceStateBefore?.channelId === joinedChannelId) {
+              playVoiceConnectSound();
+            } else if (previousVoiceState && selfVoiceStateBefore?.channelId === previousVoiceState.channelId) {
+              playVoiceLeaveSound();
+            }
+          }
+          voicePresenceByUserIdRef.current = new Map(voicePresenceByUserIdRef.current).set(
+            userId,
+            voiceState as VoiceState,
+          );
+        } else {
+          if (previousVoiceState && (isSelfUpdate || selfVoiceStateBefore?.channelId === previousVoiceState.channelId)) {
+            playVoiceLeaveSound();
+          }
+          const nextVoicePresence = new Map(voicePresenceByUserIdRef.current);
+          nextVoicePresence.delete(userId);
+          voicePresenceByUserIdRef.current = nextVoicePresence;
+        }
+      }
       void queryClient.invalidateQueries({ queryKey: ['voice-state'] });
+      return;
     }
 
     if (event.type === 'SERVER_UPDATE') {
@@ -2304,6 +3209,46 @@ export function App() {
       }
       void queryClient.invalidateQueries({ queryKey: ['session'] });
       void queryClient.invalidateQueries({ queryKey: ['admin-settings'] });
+      return;
+    }
+
+    if (event.type === 'MEMBER_UPDATE') {
+      const payload = event.payload as MemberUpdateGatewayPayload;
+      const userId = payload.userId ?? payload.member?.id;
+      const removesMember =
+        payload.action === 'leave' ||
+        payload.action === 'kick' ||
+        payload.action === 'ban';
+      const removesSelf =
+        Boolean(userId) &&
+        userId === sessionQuery.data?.user?.id &&
+        (payload.action === 'kick' || payload.action === 'ban');
+
+      if (userId && removesMember) {
+        removeCachedMember(userId);
+        setPresenceByUserId((previous) => {
+          if (!(userId in previous)) {
+            return previous;
+          }
+          const next = { ...previous };
+          delete next[userId];
+          return next;
+        });
+        setMemberProfilePopover((current) => (current?.memberId === userId ? null : current));
+      }
+
+      if (removesSelf && (payload.action === 'kick' || payload.action === 'ban')) {
+        const notice = buildServerRemovalNotice(payload.action, payload.reason);
+        setServerRemovalNotice(notice);
+        storeServerRemovalNotice(notice);
+        void queryClient.invalidateQueries({ queryKey: ['session'] });
+      }
+
+      void queryClient.invalidateQueries({ queryKey: ['members'] });
+      void queryClient.invalidateQueries({ queryKey: ['presence'] });
+      if (payload.action === 'kick' || payload.action === 'ban') {
+        void queryClient.invalidateQueries({ queryKey: ['voice-state'] });
+      }
       return;
     }
 
@@ -2334,6 +3279,17 @@ export function App() {
         const messageAlreadyCached = Boolean(
           existingMessages?.pages.some((page) => page.items.some((item) => item.id === message.id)),
         );
+        logAudioDiagnostic('message:create-event', {
+          messageId: message.id,
+          channelId: message.channelId,
+          authorId: message.authorId,
+          currentUserId: sessionQuery.data?.user?.id,
+          messageAlreadyCached,
+          willPlayNotification: !messageAlreadyCached && message.authorId !== sessionQuery.data?.user?.id,
+        });
+        if (!messageAlreadyCached && message.authorId !== sessionQuery.data?.user?.id) {
+          playIncomingMessageNotification();
+        }
         const isIncomingForCurrentChannel =
           message.channelId === currentChannel?.id &&
           Boolean(existingMessages?.pages.length) &&
@@ -2513,10 +3469,20 @@ export function App() {
       const payload = event.payload as { presence?: UserPresence };
       const { presence } = payload;
       if (presence?.userId) {
+        const wasKnownMember = knownMemberIdsRef.current.has(presence.userId);
         setPresenceByUserId((previous) => ({
           ...previous,
           [presence.userId]: presence,
         }));
+        updatePresenceCache(
+          presence,
+          presence.userId === sessionQuery.data?.user?.id && presence.status !== 'offline'
+            ? presence.status
+            : undefined,
+        );
+        if (!wasKnownMember && presence.status !== 'offline') {
+          void queryClient.invalidateQueries({ queryKey: ['members'] });
+        }
         if (
           presence.userId === sessionQuery.data?.user?.id &&
           presence.status !== 'offline'
@@ -2534,7 +3500,18 @@ export function App() {
       void queryClient.invalidateQueries({ queryKey: ['members'] });
       void queryClient.invalidateQueries({ queryKey: ['voice-state'] });
     }
-  }, [currentChannel?.id, queryClient, sessionQuery.data?.user?.id, updateCachedMessage, voiceClient.handleGatewayEvent]));
+  }, [
+    currentChannel?.id,
+    playVoiceConnectSound,
+    playVoiceLeaveSound,
+    queryClient,
+    playIncomingMessageNotification,
+    removeCachedMember,
+    sessionQuery.data?.user?.id,
+    updateCachedMessage,
+    updatePresenceCache,
+    voiceClient.handleGatewayEvent,
+  ]));
 
   useEffect(() => {
     const currentUser = sessionQuery.data?.user;
@@ -2609,6 +3586,51 @@ export function App() {
     () => (isLanMode ? memberList.filter((member) => isLanIdentity(member)) : memberList),
     [isLanMode, memberList],
   );
+
+  useEffect(() => {
+    knownMemberIdsRef.current = new Set(memberList.map((member) => member.id));
+  }, [memberList]);
+
+  useEffect(() => {
+    if (!memberProfilePopover || visibleMemberList.some((member) => member.id === memberProfilePopover.memberId)) {
+      return;
+    }
+    setMemberProfilePopover(null);
+  }, [memberProfilePopover, visibleMemberList]);
+
+  useEffect(() => {
+    if (!memberProfilePopover) {
+      return undefined;
+    }
+
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+      if (target.closest('.member-profile-popout') || target.closest('.member-profile-trigger')) {
+        return;
+      }
+      setMemberProfilePopover(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMemberProfilePopover(null);
+      }
+    };
+    const closeOnResize = () => {
+      setMemberProfilePopover(null);
+    };
+
+    window.addEventListener('pointerdown', closeOnOutsidePointer);
+    window.addEventListener('keydown', closeOnEscape);
+    window.addEventListener('resize', closeOnResize);
+    return () => {
+      window.removeEventListener('pointerdown', closeOnOutsidePointer);
+      window.removeEventListener('keydown', closeOnEscape);
+      window.removeEventListener('resize', closeOnResize);
+    };
+  }, [memberProfilePopover]);
 
   useEffect(() => {
     if (!presenceQuery.data) {
@@ -2760,13 +3782,38 @@ export function App() {
   }, [currentChannel, membersById, sessionQuery.data?.user?.id, typingByChannel]);
 
   const typingSummary = useMemo(() => formatTypingSummary(typingDisplayNames), [typingDisplayNames]);
+  const currentUserId = sessionQuery.data?.user?.id;
+  const localVoiceState = useMemo(() => {
+    if (!currentUserId) {
+      return null;
+    }
+    return (voiceStateQuery.data ?? []).find((voiceState) => voiceState.userId === currentUserId) ?? null;
+  }, [currentUserId, voiceStateQuery.data]);
+  const locallySpeakingUserId = useMemo(() => {
+    if (
+      !currentUserId ||
+      !localVoiceState ||
+      localVoiceState.muted ||
+      localVoiceState.deafened ||
+      (localVoiceState.pushToTalk && !pushToTalkHeld) ||
+      voiceClient.inputLevel <= 0.04
+    ) {
+      return null;
+    }
+    return currentUserId;
+  }, [
+    currentUserId,
+    localVoiceState,
+    pushToTalkHeld,
+    voiceClient.inputLevel,
+  ]);
 
   const voiceStatesByChannelId = useMemo(() => {
     const map = new Map<string, VoiceState[]>();
     for (const voiceState of voiceStateQuery.data ?? []) {
       const displayState = {
         ...voiceState,
-        speaking: voiceSpeakingUserIds.has(voiceState.userId),
+        speaking: voiceSpeakingUserIds.has(voiceState.userId) || voiceState.userId === locallySpeakingUserId,
       };
       const list = map.get(displayState.channelId);
       if (list) {
@@ -2776,18 +3823,18 @@ export function App() {
       }
     }
     return map;
-  }, [voiceSpeakingUserIds, voiceStateQuery.data]);
+  }, [locallySpeakingUserId, voiceSpeakingUserIds, voiceStateQuery.data]);
 
   const voicePresenceByUserId = useMemo(() => {
     const map = new Map<string, VoiceState>();
     for (const voiceState of voiceStateQuery.data ?? []) {
       map.set(voiceState.userId, {
         ...voiceState,
-        speaking: voiceSpeakingUserIds.has(voiceState.userId),
+        speaking: voiceSpeakingUserIds.has(voiceState.userId) || voiceState.userId === locallySpeakingUserId,
       });
     }
     return map;
-  }, [voiceSpeakingUserIds, voiceStateQuery.data]);
+  }, [locallySpeakingUserId, voiceSpeakingUserIds, voiceStateQuery.data]);
 
   const memberRosterSections = useMemo(() => {
     const getTopRole = (member: SessionPayload['user'] | MemberPayload): RolePayload | undefined => {
@@ -2920,6 +3967,33 @@ export function App() {
   const canOpenServerSettings =
     currentPermissions.has('ADMINISTRATOR') ||
     sessionQuery.data?.ownership?.ownerUserId === sessionQuery.data?.user?.id;
+  const showAccessRequestsButton =
+    canManageServer && sessionQuery.data?.server.registrationMode === 'manual_approval';
+
+  const accessRequestsQuery = useQuery({
+    queryKey: ['access-requests', 'pending'],
+    queryFn: () => apiGet<ServerAccessRequest[]>('/api/v1/access-requests?status=pending'),
+    enabled: configuredUserReady && showAccessRequestsButton,
+    refetchInterval: 15_000,
+  });
+
+  const approveAccessRequestMutation = useMutation({
+    mutationFn: (userId: string) => apiPost<ServerAccessRequest>(`/api/v1/access-requests/${userId}/approve`),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['access-requests'] }),
+        queryClient.invalidateQueries({ queryKey: ['members'] }),
+        queryClient.invalidateQueries({ queryKey: ['presence'] }),
+      ]);
+    },
+  });
+
+  const denyAccessRequestMutation = useMutation({
+    mutationFn: (userId: string) => apiPost<ServerAccessRequest>(`/api/v1/access-requests/${userId}/deny`),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['access-requests'] });
+    },
+  });
 
   useEffect(() => {
     if (!isGifModalOpen || gifTab !== 'gifs') {
@@ -3135,6 +4209,7 @@ export function App() {
         content: encryptedContent ? '' : plainContent,
         encryptedContent,
         parentMessageId,
+        notificationMentions: extractNotificationMentionHandles(plainContent),
         gifUrl: input?.gifUrl,
         attachmentIds: input?.attachmentIds ?? attachmentIds,
       });
@@ -3544,7 +4619,7 @@ export function App() {
   }, [clearEmojiLongPressTimer]);
 
   const handleForwardMessage = useCallback((message: Message) => {
-    const author = membersById.get(message.authorId);
+    const author = getMessageAuthor(message, membersById);
     const preview = getMessagePreviewText(message, decryptedMessages[message.id], e2eeState);
     const forwardedText = `Forwarded from ${author?.displayName ?? 'Unknown member'}: ${preview}`;
     const nextValue = messageText.trim().length > 0 ? `${messageText}\n${forwardedText}` : forwardedText;
@@ -3631,7 +4706,9 @@ export function App() {
       await voiceClient.join(channelId, {
         muted: selfVoiceState?.muted ?? false,
         deafened: selfVoiceState?.deafened ?? false,
-        pushToTalk: selfVoiceState?.pushToTalk ?? true,
+        pushToTalk: desktopSoundSettingsControlled
+          ? desktopSoundSettings.pushToTalkMode !== 'voice_activity'
+          : selfVoiceState?.pushToTalk ?? true,
       });
     },
     onSuccess: async () => {
@@ -3670,6 +4747,7 @@ export function App() {
         ...previous,
         [payload.presence.userId]: payload.presence,
       }));
+      updatePresenceCache(payload.presence, payload.selfStatus);
     },
   });
 
@@ -3912,6 +4990,32 @@ export function App() {
   }, [actionModal, queryClient]);
 
   const connectedVoiceChannelId = selfVoiceState?.channelId ?? null;
+
+  useEffect(() => {
+    const connected = Boolean(connectedVoiceChannelId);
+    const voiceState: CurrentGaiaVoiceState = {
+      connected,
+      ...(connectedVoiceChannelId ? { channelId: connectedVoiceChannelId } : {}),
+      status: voiceClient.status,
+    };
+
+    window.__CURRENT_GAIA_VOICE_STATE__ = voiceState;
+    document.documentElement.dataset.gaiaVoiceConnected = connected ? 'true' : 'false';
+    document.body.dataset.gaiaVoiceConnected = connected ? 'true' : 'false';
+
+    return () => {
+      window.__CURRENT_GAIA_VOICE_STATE__ = {
+        connected: false,
+        status: 'idle',
+      };
+      delete document.documentElement.dataset.gaiaVoiceConnected;
+      delete document.body.dataset.gaiaVoiceConnected;
+    };
+  }, [connectedVoiceChannelId, voiceClient.status]);
+
+  const isGaiaLauncherClient = isGaiaLauncherRuntime();
+  const desktopPushToTalkEnabled = desktopSoundSettings.pushToTalkMode !== 'voice_activity';
+  const desktopPushToTalkIsToggle = desktopSoundSettings.pushToTalkMode === 'toggle';
   const selfVoiceInputDisabled = Boolean(
     !selfVoiceState ||
     selfVoiceState.muted ||
@@ -3959,6 +5063,21 @@ export function App() {
     patchVoiceStateMutation.mutate(input);
   }, [patchVoiceStateMutation, selfVoiceState]);
 
+  useEffect(() => {
+    if (!desktopSoundSettingsControlled || !selfVoiceState) {
+      return;
+    }
+    if (selfVoiceState.pushToTalk !== desktopPushToTalkEnabled) {
+      patchVoiceStateMutation.mutate({ pushToTalk: desktopPushToTalkEnabled });
+    }
+  }, [
+    desktopPushToTalkEnabled,
+    desktopSoundSettingsControlled,
+    patchVoiceStateMutation,
+    selfVoiceState?.pushToTalk,
+    selfVoiceState?.userId,
+  ]);
+
   const setSpeakingState = useCallback((speaking: boolean) => {
     if (!selfVoiceState || !selfVoiceState.pushToTalk) {
       return;
@@ -3969,6 +5088,56 @@ export function App() {
     setPushToTalkHeld(speaking);
     voiceClient.setInputEnabled(speaking);
   }, [selfVoiceState, voiceClient.setInputEnabled]);
+
+  useEffect(() => {
+    if (!desktopSoundSettingsControlled || !selfVoiceState?.pushToTalk) {
+      return;
+    }
+
+    const preserveTyping = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target?.closest('input, textarea, [contenteditable="true"]')) {
+        event.preventDefault();
+      }
+      event.stopPropagation();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!keybindMatchesKeyboardEvent(desktopSoundSettings.pushToTalkKey, event)) {
+        return;
+      }
+      preserveTyping(event);
+      if (desktopPushToTalkIsToggle) {
+        if (!event.repeat) {
+          setSpeakingState(!pushToTalkHeld);
+        }
+        return;
+      }
+      setSpeakingState(true);
+    };
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (!keybindMatchesKeyboardEvent(desktopSoundSettings.pushToTalkKey, event)) {
+        return;
+      }
+      preserveTyping(event);
+      if (!desktopPushToTalkIsToggle) {
+        setSpeakingState(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown, true);
+    window.addEventListener('keyup', handleKeyUp, true);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown, true);
+      window.removeEventListener('keyup', handleKeyUp, true);
+    };
+  }, [
+    desktopPushToTalkIsToggle,
+    desktopSoundSettings.pushToTalkKey,
+    desktopSoundSettingsControlled,
+    pushToTalkHeld,
+    selfVoiceState?.pushToTalk,
+    setSpeakingState,
+  ]);
 
   useEffect(() => {
     const inputEnabled = Boolean(
@@ -3987,6 +5156,13 @@ export function App() {
     selfVoiceState?.muted,
     selfVoiceState?.pushToTalk,
     voiceClient.setInputEnabled,
+  ]);
+
+  useEffect(() => {
+    voiceClient.setOutputEnabled(!(selfVoiceState?.deafened ?? false));
+  }, [
+    selfVoiceState?.deafened,
+    voiceClient.setOutputEnabled,
   ]);
 
   const ensureMessageLoadedForJump = useCallback(async (channelId: string, messageId: string) => {
@@ -4336,11 +5512,66 @@ export function App() {
     );
   }
 
+  const activeServerRemovalNotice =
+    getServerRemovalNoticeFromError(sessionQuery.error) ?? serverRemovalNotice;
+
+  if (activeServerRemovalNotice) {
+    if (activeServerRemovalNotice.type === 'kick') {
+      return (
+        <AuthScreen
+          authMode={setupQuery.data?.authMode ?? 'atproto'}
+          title={activeServerRemovalNotice.message}
+          subtitle={
+            activeServerRemovalNotice.reason
+              ? `Reason: ${activeServerRemovalNotice.reason}`
+              : 'Sign in again to rejoin this server.'
+          }
+          onAuthStart={clearServerRemovalNotice}
+        />
+      );
+    }
+
+    return <ServerRemovalScreen notice={activeServerRemovalNotice} />;
+  }
+
   if (sessionQuery.isError || !sessionQuery.data?.user) {
-    return <AuthScreen authMode={setupQuery.data?.authMode ?? 'atproto'} />;
+    return (
+      <AuthScreen
+        authMode={setupQuery.data?.authMode ?? 'atproto'}
+        onAuthStart={clearServerRemovalNotice}
+      />
+    );
+  }
+
+  if (sessionQuery.data.access && sessionQuery.data.access.state !== 'approved') {
+    return (
+      <AccessGateScreen
+        access={sessionQuery.data.access}
+        serverName={sessionQuery.data.server.name}
+        onJoinWaitlist={() => joinWaitlistMutation.mutate()}
+        onClaimInvite={(code) => claimInviteMutation.mutate(code)}
+        joiningWaitlist={joinWaitlistMutation.isPending}
+        claimingInvite={claimInviteMutation.isPending}
+        error={
+          (joinWaitlistMutation.error instanceof Error ? joinWaitlistMutation.error.message : undefined) ??
+          (claimInviteMutation.error instanceof Error ? claimInviteMutation.error.message : undefined)
+        }
+      />
+    );
   }
 
   const currentUser = sessionQuery.data.user;
+  const memberProfileMember = memberProfilePopover ? membersById.get(memberProfilePopover.memberId) ?? null : null;
+  const memberProfileIsSelf = memberProfileMember?.id === currentUser.id;
+  const memberProfileBlueskyUrl = getBlueskyProfileUrl(memberProfileMember);
+  const memberProfileBio = memberProfileMember?.bio?.trim() ?? '';
+  const memberProfilePresence = memberProfileMember
+    ? presenceByUserId[memberProfileMember.id] ?? {
+        userId: memberProfileMember.id,
+        status: 'offline' as const,
+        connected: false,
+      }
+    : null;
   const selfPresence =
     presenceByUserId[currentUser.id] ?? {
       userId: currentUser.id,
@@ -4357,7 +5588,7 @@ export function App() {
     ),
   ).length;
   const replyDraftMessage = replyDraft ? messagesById.get(replyDraft.messageId) ?? null : null;
-  const replyDraftAuthor = replyDraftMessage ? membersById.get(replyDraftMessage.authorId) : null;
+  const replyDraftAuthor = getMessageAuthor(replyDraftMessage, membersById);
   const replyDraftPreview = replyDraftMessage
     ? getMessagePreviewText(replyDraftMessage, decryptedMessages[replyDraftMessage.id], e2eeState)
     : 'Message';
@@ -4604,7 +5835,7 @@ export function App() {
     }
 
     const message = context.message;
-    const author = membersById.get(message.authorId);
+    const author = getMessageAuthor(message, membersById);
     const isOwnMessage = message.authorId === currentUser.id;
     const canDeleteMessage = isOwnMessage || canManageMessages;
     const textReady = !message.encryptedContent || decryptedMessages[message.id]?.status === 'ready';
@@ -4691,6 +5922,7 @@ export function App() {
   };
 
   const shellAppearance = appearancePreview ?? sessionQuery.data?.server.appearance;
+  const pendingAccessRequestCount = accessRequestsQuery.data?.length ?? 0;
 
   return (
     <div
@@ -4716,6 +5948,8 @@ export function App() {
             key={remote.producerId}
             remote={remote}
             muted={selfVoiceState?.deafened ?? false}
+            outputDeviceId={desktopSoundSettings.outputDeviceId}
+            volume={desktopSoundSettings.outputVolume}
           />
         ))}
       </div>
@@ -4730,6 +5964,21 @@ export function App() {
                 onClick={() => setIsServerSettingsOpen(true)}
               >
                 ⚙
+              </button>
+            )}
+            {showAccessRequestsButton && (
+              <button
+                className="channels-access-requests-button"
+                aria-label={`Join requests${pendingAccessRequestCount > 0 ? `, ${pendingAccessRequestCount} pending` : ''}`}
+                title="Join requests"
+                onClick={() => setIsAccessRequestsOpen(true)}
+              >
+                <JoinRequestsIcon />
+                {pendingAccessRequestCount > 0 && (
+                  <span className="channels-action-badge" aria-hidden>
+                    {pendingAccessRequestCount > 99 ? '99+' : pendingAccessRequestCount}
+                  </span>
+                )}
               </button>
             )}
             <button
@@ -4920,14 +6169,16 @@ export function App() {
             )}
           </div>
 
-          <button
-            className="logout-button"
-            onClick={() => {
-              void apiPost('/api/v1/auth/logout').then(() => window.location.reload());
-            }}
-          >
-            Log out
-          </button>
+          {!isGaiaLauncherClient && (
+            <button
+              className="logout-button"
+              onClick={() => {
+                void apiPost('/api/v1/auth/logout').then(() => window.location.reload());
+              }}
+            >
+              Log out
+            </button>
+          )}
 
           {!selfVoiceState && voiceClient.status !== 'idle' && (
             <div className={`voice-status voice-status-${voiceClient.status}`}>
@@ -4963,37 +6214,64 @@ export function App() {
                 disabled={selfVoiceInputDisabled}
               />
 
-              <div className="voice-controls">
+              <div className={`voice-controls ${isGaiaLauncherClient ? 'voice-controls-single' : ''}`}>
                 <button
                   className={selfVoiceState.muted ? 'active' : ''}
                   onClick={() => updateVoiceState({ muted: !selfVoiceState.muted })}
                 >
                   {selfVoiceState.muted ? 'Unmute' : 'Mute'}
                 </button>
-                <button
-                  className={selfVoiceState.deafened ? 'active' : ''}
-                  onClick={() => updateVoiceState({ deafened: !selfVoiceState.deafened })}
-                >
-                  {selfVoiceState.deafened ? 'Undeafen' : 'Deafen'}
-                </button>
-                <button
-                  className={selfVoiceState.pushToTalk ? 'active' : ''}
-                  onClick={() => updateVoiceState({ pushToTalk: !selfVoiceState.pushToTalk })}
-                >
-                  PTT
-                </button>
+                {!isGaiaLauncherClient && (
+                  <button
+                    className={selfVoiceState.pushToTalk ? 'active' : ''}
+                    onClick={() => {
+                      if (!desktopSoundSettingsControlled) {
+                        updateVoiceState({ pushToTalk: !selfVoiceState.pushToTalk });
+                      }
+                    }}
+                    disabled={desktopSoundSettingsControlled}
+                    title={desktopSoundSettingsControlled ? 'Managed by Gaia sound settings' : undefined}
+                  >
+                    {desktopSoundSettingsControlled && !desktopPushToTalkEnabled ? 'Voice' : 'PTT'}
+                  </button>
+                )}
               </div>
 
               {selfVoiceState.pushToTalk && (
                 <button
                   className={`voice-ptt ${pushToTalkHeld ? 'active' : ''}`}
-                  onMouseDown={() => setSpeakingState(true)}
-                  onMouseUp={() => setSpeakingState(false)}
-                  onMouseLeave={() => setSpeakingState(false)}
-                  onTouchStart={() => setSpeakingState(true)}
-                  onTouchEnd={() => setSpeakingState(false)}
+                  onClick={() => {
+                    if (desktopSoundSettingsControlled && desktopPushToTalkIsToggle) {
+                      setSpeakingState(!pushToTalkHeld);
+                    }
+                  }}
+                  onMouseDown={() => {
+                    if (!desktopPushToTalkIsToggle) {
+                      setSpeakingState(true);
+                    }
+                  }}
+                  onMouseUp={() => {
+                    if (!desktopPushToTalkIsToggle) {
+                      setSpeakingState(false);
+                    }
+                  }}
+                  onMouseLeave={() => {
+                    if (!desktopPushToTalkIsToggle) {
+                      setSpeakingState(false);
+                    }
+                  }}
+                  onTouchStart={() => {
+                    if (!desktopPushToTalkIsToggle) {
+                      setSpeakingState(true);
+                    }
+                  }}
+                  onTouchEnd={() => {
+                    if (!desktopPushToTalkIsToggle) {
+                      setSpeakingState(false);
+                    }
+                  }}
                 >
-                  {pushToTalkHeld ? 'Talking' : 'Hold To Talk'}
+                  {pushToTalkHeld ? 'Talking' : desktopPushToTalkIsToggle ? 'Toggle To Talk' : 'Hold To Talk'}
                 </button>
               )}
 
@@ -5144,7 +6422,7 @@ export function App() {
             <section className="messages-list" ref={messagesListRef} onScroll={handleMessagesScroll}>
               {messagesQuery.isFetchingNextPage && <small className="list-loading">Loading older messages…</small>}
               {messages.map((message) => {
-                const author = membersById.get(message.authorId);
+                const author = getMessageAuthor(message, membersById);
                 const isOwnMessage = message.authorId === currentUser.id;
                 const attachments = message.attachments ?? [];
                 const mediaAttachments = attachments.filter(
@@ -5161,7 +6439,7 @@ export function App() {
                   message.encryptedContent && decryptedMessages[message.id]?.status !== 'ready',
                 );
                 const parentMessage = message.parentMessageId ? messagesById.get(message.parentMessageId) : null;
-                const parentAuthor = parentMessage ? membersById.get(parentMessage.authorId) : null;
+                const parentAuthor = getMessageAuthor(parentMessage, membersById);
                 const parentPreview = parentMessage
                   ? getMessagePreviewText(parentMessage, decryptedMessages[parentMessage.id], e2eeState)
                   : 'Message unavailable';
@@ -5234,9 +6512,15 @@ export function App() {
                     <button
                       type="button"
                       className="message-hover-icon"
-                      onClick={() => handleCopyMessageId(message)}
-                      aria-label="Copy message ID"
-                      title="Copy message ID"
+                      onClick={(event) => {
+                        const menuContext: AppContextMenu = {
+                          kind: 'message',
+                          message,
+                        };
+                        contextMenu.open(event, menuContext, contextMenuSections(menuContext));
+                      }}
+                      aria-label="More message actions"
+                      title="More message actions"
                     >
                       <span className="message-hover-symbol">…</span>
                     </button>
@@ -5477,7 +6761,11 @@ export function App() {
                       if (!file) {
                         return;
                       }
-                      void uploadAttachment(file).then((attachment) => {
+                      const channelId = currentChannel?.id;
+                      if (!channelId) {
+                        return;
+                      }
+                      void uploadAttachment(file, channelId).then((attachment) => {
                         setAttachmentIds((prev) => [...prev, attachment.id]);
                       });
                     }}
@@ -5697,6 +6985,7 @@ export function App() {
                 const inVoice = Boolean(voiceState);
                 const speaking = voiceState?.speaking ?? false;
                 const isSelf = member.id === currentUser.id;
+                const profileOpen = memberProfilePopover?.memberId === member.id;
                 const statusLabel = speaking && isVisibleOnlinePresence(presence)
                   ? 'Speaking'
                   : inVoice && isVisibleOnlinePresence(presence)
@@ -5706,33 +6995,42 @@ export function App() {
                   ? 'speaking'
                   : getPresenceClassName(presence.status);
                 return (
-                  <li
-                    key={member.id}
-                    id={`member-item-${member.id}`}
-                    className={`member-item ${highlightedMemberId === member.id ? 'search-highlight' : ''}`}
-                    onContextMenu={(event) => {
-                      const menuContext: AppContextMenu = {
-                        kind: 'member',
-                        member,
-                      };
-                      contextMenu.open(event, menuContext, contextMenuSections(menuContext));
-                    }}
-                  >
-                    <div className="member-main">
-                      <Avatar src={member.avatarUrl} name={member.displayName} size="sm" />
-                      <div className="member-text">
-                        <strong>{member.displayName}{isSelf ? ' (You)' : ''}</strong>
-                        <small>{formatIdentityHandle(member)}</small>
-                      </div>
-                    </div>
-                    <div className="member-presence">
-                      <span className="member-presence-label">{statusLabel}</span>
-                      <span
-                        className={`member-state ${stateClassName}`}
-                        title={topRole?.name ?? statusLabel}
-                      />
-                    </div>
-                  </li>
+                  <Fragment key={member.id}>
+                    <li
+                      id={`member-item-${member.id}`}
+                      className={`member-item ${profileOpen ? 'profile-open' : ''} ${highlightedMemberId === member.id ? 'search-highlight' : ''}`}
+                      onContextMenu={(event) => {
+                        const menuContext: AppContextMenu = {
+                          kind: 'member',
+                          member,
+                        };
+                        contextMenu.open(event, menuContext, contextMenuSections(menuContext));
+                      }}
+                    >
+                      <button
+                        type="button"
+                        className="member-profile-trigger"
+                        aria-expanded={profileOpen}
+                        aria-controls={profileOpen ? 'member-profile-popout' : undefined}
+                        onClick={(event) => toggleMemberProfilePopover(member.id, event)}
+                      >
+                        <div className="member-main">
+                          <Avatar src={member.avatarUrl} name={member.displayName} size="sm" />
+                          <div className="member-text">
+                            <strong>{member.displayName}{isSelf ? ' (You)' : ''}</strong>
+                            <small>{formatIdentityHandle(member)}</small>
+                          </div>
+                        </div>
+                        <div className="member-presence">
+                          <span className="member-presence-label">{statusLabel}</span>
+                          <span
+                            className={`member-state ${stateClassName}`}
+                            title={topRole?.name ?? statusLabel}
+                          />
+                        </div>
+                      </button>
+                    </li>
+                  </Fragment>
                 );
               })}
             </Fragment>
@@ -5740,6 +7038,75 @@ export function App() {
         </ul>
         {membersQuery.isFetchingNextPage && <small className="list-loading">Loading members…</small>}
       </aside>
+      {memberProfilePopover && memberProfileMember && memberProfilePresence && (
+        <section
+          id="member-profile-popout"
+          className={`member-profile-popout liquid-surface ${isOverLightBackground ? 'over-light-background' : ''}`}
+          style={{
+            '--member-profile-popout-left': `${memberProfilePopover.left}px`,
+            '--member-profile-popout-top': `${memberProfilePopover.top}px`,
+          } as CSSProperties}
+          role="dialog"
+          aria-label={`${memberProfileMember.displayName} profile`}
+        >
+          <LiquidGlassBackdrop
+            className="member-profile-liquid-glass"
+            cornerRadius={24}
+            displacementScale={96}
+            blurAmount={0.22}
+            saturation={152}
+            aberrationIntensity={1.8}
+            elasticity={0}
+            mode="prominent"
+            overLight={isOverLightBackground}
+          />
+          <div className="member-profile-popout-banner" aria-hidden="true" />
+          <button
+            type="button"
+            className="member-profile-popout-close"
+            aria-label="Close profile"
+            onClick={() => setMemberProfilePopover(null)}
+          >
+            ×
+          </button>
+          <div className="member-profile-popout-body">
+            <div className="member-profile-popout-summary">
+              <div className="member-profile-popout-avatar">
+                <Avatar src={memberProfileMember.avatarUrl} name={memberProfileMember.displayName} size="md" />
+                <span
+                  className={`member-profile-popout-status ${getPresenceClassName(memberProfilePresence.status)}`}
+                  title={getMemberPresenceLabel(memberProfilePresence.status)}
+                />
+              </div>
+              <div className="member-profile-popout-copy">
+                <strong>{memberProfileMember.displayName}{memberProfileIsSelf ? ' (You)' : ''}</strong>
+                <small>{formatIdentityHandle(memberProfileMember)}</small>
+              </div>
+            </div>
+            {memberProfileBio.length > 0 && <p className="member-profile-popout-bio">{memberProfileBio}</p>}
+            <div className="member-profile-popout-actions">
+              {memberProfileBlueskyUrl ? (
+                <a href={memberProfileBlueskyUrl} target="_blank" rel="noreferrer">
+                  <svg
+                    className="member-profile-popout-bsky-logo"
+                    viewBox="0 0 600 530"
+                    aria-hidden
+                    focusable="false"
+                  >
+                    <path
+                      fill="currentColor"
+                      d="M135 49c71 54 145 160 165 201 20-41 94-147 165-201 52-39 135-69 135 28 0 19-11 161-17 184-21 79-100 99-169 87 122 20 153 86 85 152-128 126-184-32-199-72-3-7-4-10-3-7-1-3-2 0-3 7-15 40-71 198-199 72-68-66-37-132 85-152-69 12-148-8-169-87-6-23-17-165-17-184 0-97 83-67 135-28Z"
+                    />
+                  </svg>
+                  <span>Open Profile</span>
+                </a>
+              ) : (
+                <span>LAN-only profile</span>
+              )}
+            </div>
+          </div>
+        </section>
+      )}
       {isSearchModalOpen && (
         <div className="search-modal-backdrop" onClick={() => setIsSearchModalOpen(false)}>
           <section
@@ -5822,7 +7189,7 @@ export function App() {
                       <small>{section.items.length}</small>
                     </header>
                     {section.items.map((message) => {
-                      const author = membersById.get(message.authorId);
+                      const author = getMessageAuthor(message, membersById);
                       const dateLabel = new Date(message.createdAt).toLocaleString();
                       const displayContent = getDisplayMessageContent(message, decryptedMessages[message.id], e2eeState);
                       const preview =
@@ -6085,6 +7452,21 @@ export function App() {
           )}
         </div>
       )}
+      <AccessRequestsModal
+        open={isAccessRequestsOpen}
+        requests={accessRequestsQuery.data ?? []}
+        loading={accessRequestsQuery.isLoading}
+        approvingUserId={approveAccessRequestMutation.isPending ? approveAccessRequestMutation.variables : undefined}
+        denyingUserId={denyAccessRequestMutation.isPending ? denyAccessRequestMutation.variables : undefined}
+        onClose={() => setIsAccessRequestsOpen(false)}
+        onApprove={(userId) => approveAccessRequestMutation.mutate(userId)}
+        onDeny={(userId) => denyAccessRequestMutation.mutate(userId)}
+        error={
+          (approveAccessRequestMutation.error instanceof Error ? approveAccessRequestMutation.error.message : undefined) ??
+          (denyAccessRequestMutation.error instanceof Error ? denyAccessRequestMutation.error.message : undefined)
+        }
+        overLight={isOverLightBackground}
+      />
       <ServerSettingsModal
         open={isServerSettingsOpen}
         onClose={() => {
@@ -6391,14 +7773,132 @@ function inferDefaultServerPublicUrl(): string {
   return base.toString().replace(/\/$/, '');
 }
 
+function ServerRemovalScreen({ notice }: { notice: ServerRemovalNotice }) {
+  return (
+    <div className="wizard-wrap auth-wrap">
+      <div className="wizard-card auth-card server-removal-card">
+        <div className="auth-card-head">
+          <img className="current-logo auth-logo" src={CURRENT_LOGO_URL} alt="Current" decoding="async" />
+          <h1>{notice.message}</h1>
+          {notice.reason ? (
+            <p className="server-removal-reason">Reason: {notice.reason}</p>
+          ) : (
+            <p>This server is not accepting this account.</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AccessGateScreen({
+  access,
+  serverName,
+  onJoinWaitlist,
+  onClaimInvite,
+  joiningWaitlist,
+  claimingInvite,
+  error,
+}: {
+  access: ServerAccess;
+  serverName: string;
+  onJoinWaitlist: () => void;
+  onClaimInvite: (code: string) => void;
+  joiningWaitlist: boolean;
+  claimingInvite: boolean;
+  error?: string;
+}) {
+  const [inviteCode, setInviteCode] = useState('');
+  const normalizedInviteCode = inviteCode.trim();
+  const notificationLabel = access.request?.notificationsEnabled
+    ? 'Notifications enabled'
+    : isGaiaLauncherRuntime()
+      ? 'Launcher notifications enabled'
+      : 'Notifications off';
+
+  const title =
+    access.state === 'pending'
+      ? 'Waiting For Approval'
+      : access.state === 'denied'
+        ? 'Request Denied'
+        : access.state === 'invite_required'
+          ? 'Invite Required'
+          : 'Join Wait List';
+  const message =
+    access.state === 'pending'
+      ? `${serverName} has your request.`
+      : access.state === 'denied'
+        ? `${serverName} is not accepting this account.`
+        : access.state === 'invite_required'
+          ? `${serverName} requires an invite code.`
+          : `${serverName} is using manual approval.`;
+
+  return (
+    <div className="wizard-wrap auth-wrap">
+      <div className="wizard-card auth-card access-gate-card">
+        <div className="auth-card-head">
+          <img className="current-logo auth-logo" src={CURRENT_LOGO_URL} alt="Current" decoding="async" />
+          <h1>{title}</h1>
+          <p>{message}</p>
+        </div>
+
+        {access.state === 'not_requested' && (
+          <div className="access-gate-actions">
+            <button type="button" onClick={onJoinWaitlist} disabled={joiningWaitlist}>
+              {joiningWaitlist ? 'Joining...' : 'Join Wait List'}
+            </button>
+            <small>Browser notifications can alert you when an admin approves the request.</small>
+          </div>
+        )}
+
+        {access.state === 'pending' && (
+          <div className="access-gate-status">
+            <strong>{notificationLabel}</strong>
+            <small>Leave this window open to get the acceptance alert here.</small>
+          </div>
+        )}
+
+        {access.state === 'invite_required' && (
+          <form
+            className="access-gate-invite"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (normalizedInviteCode.length > 0) {
+                onClaimInvite(normalizedInviteCode);
+              }
+            }}
+          >
+            <label>
+              Invite code
+              <input
+                value={inviteCode}
+                onChange={(event) => setInviteCode(event.target.value)}
+                placeholder="Paste invite code"
+                autoComplete="off"
+              />
+            </label>
+            <button type="submit" disabled={claimingInvite || normalizedInviteCode.length === 0}>
+              {claimingInvite ? 'Checking...' : 'Join Server'}
+            </button>
+          </form>
+        )}
+
+        {error && <small className="auth-error">{error}</small>}
+      </div>
+    </div>
+  );
+}
+
 function AuthScreen({
   authMode = 'atproto',
   title,
   subtitle,
+  onAuthStart,
 }: {
   authMode?: AuthMode;
   title?: string;
   subtitle?: string;
+  onAuthStart?: () => void;
 }) {
   const [lanScreenName, setLanScreenName] = useState('');
   const [lanHandoff, setLanHandoff] = useState<OAuthLanHandoffPayload | null>(null);
@@ -6409,6 +7909,7 @@ function AuthScreen({
 
   const oauthMutation = useMutation({
     mutationFn: () => {
+      onAuthStart?.();
       const params = new URLSearchParams({
         handle: 'https://bsky.social',
         returnTo: window.location.origin + window.location.pathname,
@@ -6427,9 +7928,14 @@ function AuthScreen({
   });
 
   const lanHandoffStatusQuery = useQuery({
-    queryKey: ['auth', 'lan-handoff', lanHandoff?.handoffId],
-    queryFn: () => apiGet<OAuthLanHandoffStatusPayload>(`/api/v1/auth/lan/handoffs/${lanHandoff?.handoffId}`),
-    enabled: Boolean(lanHandoff?.handoffId),
+    queryKey: ['auth', 'lan-handoff', lanHandoff?.handoffId, lanHandoff?.claimToken],
+    queryFn: () => {
+      const params = new URLSearchParams({ claimToken: lanHandoff?.claimToken ?? '' });
+      return apiGet<OAuthLanHandoffStatusPayload>(
+        `/api/v1/auth/lan/handoffs/${lanHandoff?.handoffId}?${params.toString()}`,
+      );
+    },
+    enabled: Boolean(lanHandoff?.handoffId && lanHandoff?.claimToken),
     retry: false,
     refetchInterval: (query) => {
       const status = query.state.data?.status;
@@ -6441,8 +7947,12 @@ function AuthScreen({
   });
 
   const claimLanHandoffMutation = useMutation({
-    mutationFn: (handoffId: string) =>
-      apiPost<{ ticket: string }>(`/api/v1/auth/lan/handoffs/${handoffId}/claim`),
+    mutationFn: (handoff: OAuthLanHandoffPayload) => {
+      onAuthStart?.();
+      return apiPost<{ ticket: string }>(`/api/v1/auth/lan/handoffs/${handoff.handoffId}/claim`, {
+        claimToken: handoff.claimToken,
+      });
+    },
     onSuccess: async ({ ticket }) => {
       await apiPost<void>('/api/v1/auth/exchange', { ticket });
       window.location.reload();
@@ -6450,7 +7960,7 @@ function AuthScreen({
   });
 
   useEffect(() => {
-    if (!lanHandoff?.handoffId) {
+    if (!lanHandoff?.handoffId || !lanHandoff.claimToken) {
       return;
     }
     if (lanHandoffStatusQuery.data?.status !== 'ready') {
@@ -6459,18 +7969,22 @@ function AuthScreen({
     if (claimLanHandoffMutation.isPending || claimLanHandoffMutation.isSuccess) {
       return;
     }
-    claimLanHandoffMutation.mutate(lanHandoff.handoffId);
+    claimLanHandoffMutation.mutate(lanHandoff);
   }, [
     claimLanHandoffMutation,
+    lanHandoff,
     lanHandoff?.handoffId,
+    lanHandoff?.claimToken,
     lanHandoffStatusQuery.data?.status,
   ]);
 
   const lanLoginMutation = useMutation({
-    mutationFn: () =>
-      apiPost<{ user: SessionPayload['user'] }>('/api/v1/auth/lan-login', {
+    mutationFn: () => {
+      onAuthStart?.();
+      return apiPost<{ user: SessionPayload['user'] }>('/api/v1/auth/lan-login', {
         screenName: lanScreenName.trim(),
-      }),
+      });
+    },
     onSuccess: () => {
       window.location.reload();
     },
@@ -6558,6 +8072,88 @@ function AuthScreen({
         )}
         {authError && <small className="auth-error">{authError}</small>}
       </div>
+    </div>
+  );
+}
+
+function AccessRequestsModal({
+  open,
+  requests,
+  loading,
+  approvingUserId,
+  denyingUserId,
+  onClose,
+  onApprove,
+  onDeny,
+  error,
+  overLight,
+}: {
+  open: boolean;
+  requests: ServerAccessRequest[];
+  loading: boolean;
+  approvingUserId?: string;
+  denyingUserId?: string;
+  onClose: () => void;
+  onApprove: (userId: string) => void;
+  onDeny: (userId: string) => void;
+  error?: string;
+  overLight: boolean;
+}) {
+  if (!open) {
+    return null;
+  }
+
+  return (
+    <div className="access-requests-backdrop" onClick={onClose}>
+      <section
+        className={`access-requests-modal glass-panel ${overLight ? 'over-light-background' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Join requests"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="access-requests-header">
+          <div>
+            <h2>Join Requests</h2>
+            <small>{requests.length} pending</small>
+          </div>
+          <button className="access-requests-close" type="button" onClick={onClose} aria-label="Close join requests">
+            ×
+          </button>
+        </header>
+
+        <div className="access-requests-list">
+          {loading && <p className="access-requests-empty">Loading requests...</p>}
+          {!loading && requests.length === 0 && <p className="access-requests-empty">No pending requests.</p>}
+          {requests.map((request) => {
+            const user = request.user;
+            const displayName = user?.displayName ?? 'Unknown user';
+            const handle = user ? formatIdentityHandle(user) : request.userId;
+            const busy = approvingUserId === request.userId || denyingUserId === request.userId;
+            return (
+              <article key={request.id} className="access-request-card">
+                <div className="access-request-user">
+                  <Avatar src={user?.avatarUrl} name={displayName} size="md" />
+                  <div>
+                    <strong>{displayName}</strong>
+                    <small>{handle}</small>
+                    <span>{new Date(request.requestedAt).toLocaleString()}</span>
+                  </div>
+                </div>
+                <div className="access-request-actions">
+                  <button type="button" onClick={() => onDeny(request.userId)} disabled={busy}>
+                    Deny
+                  </button>
+                  <button type="button" className="primary" onClick={() => onApprove(request.userId)} disabled={busy}>
+                    Allow
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+        {error && <small className="auth-error access-requests-error">{error}</small>}
+      </section>
     </div>
   );
 }

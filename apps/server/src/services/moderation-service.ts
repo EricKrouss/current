@@ -6,6 +6,7 @@ import type {
   Permission,
   Role,
 } from '@current/types';
+import type { ServerRemovalStatus } from '../db/repositories/moderation-repository.js';
 import type { RepositoryBag } from '../db/repositories/index.js';
 import type { MetricsService } from '../metrics/metrics-service.js';
 import { nowIso } from '../utils/time.js';
@@ -49,6 +50,11 @@ export class ModerationService {
     position?: number;
     permissions?: Permission[];
   }): Role | null {
+    const existing = this.repos.roles.list(input.serverId).find((role) => role.id === input.roleId);
+    if (!existing) {
+      return null;
+    }
+
     const role = this.repos.roles.update(input.roleId, {
       name: input.name,
       color: input.color,
@@ -72,7 +78,12 @@ export class ModerationService {
     return role;
   }
 
-  deleteRole(input: { roleId: string; serverId: string; actorId: string }): void {
+  deleteRole(input: { roleId: string; serverId: string; actorId: string }): boolean {
+    const existing = this.repos.roles.list(input.serverId).find((role) => role.id === input.roleId);
+    if (!existing) {
+      return false;
+    }
+
     this.repos.roles.delete(input.roleId);
     this.repos.audit.create({
       serverId: input.serverId,
@@ -82,6 +93,7 @@ export class ModerationService {
       targetId: input.roleId,
       payload: {},
     });
+    return true;
   }
 
   setMemberRoles(input: {
@@ -157,6 +169,13 @@ export class ModerationService {
     const action = this.repos.moderation.create(input);
     this.metrics.incrementModerationActions();
 
+    if (input.type === 'kick' || input.type === 'ban') {
+      this.revokeServerAccess({
+        serverId: input.serverId,
+        targetUserId: input.targetUserId,
+      });
+    }
+
     this.repos.audit.create({
       serverId: input.serverId,
       actorId: input.actorId,
@@ -172,8 +191,25 @@ export class ModerationService {
     return action;
   }
 
+  private revokeServerAccess(input: { serverId: string; targetUserId: string }): void {
+    const target = this.repos.users.findById(input.targetUserId);
+    if (target) {
+      const serverRoleIds = new Set(this.repos.roles.list(input.serverId).map((role) => role.id));
+      const remainingRoleIds = target.roleIds.filter((roleId) => !serverRoleIds.has(roleId));
+      if (remainingRoleIds.length !== target.roleIds.length) {
+        this.repos.users.setRoles(input.targetUserId, remainingRoleIds);
+      }
+    }
+
+    this.repos.accessRequests.delete(input.serverId, input.targetUserId);
+  }
+
   listActions(serverId: string, targetUserId?: string): ModerationAction[] {
     return this.repos.moderation.list(serverId, targetUserId);
+  }
+
+  getServerRemovalStatus(serverId: string, userId: string): ServerRemovalStatus | null {
+    return this.repos.moderation.getServerRemovalStatus(serverId, userId);
   }
 
   isBlockedFromMessaging(serverId: string, userId: string): { blocked: boolean; reason?: string } {
@@ -196,6 +232,11 @@ export class ModerationService {
     locked: boolean;
     slowmodeSeconds?: number;
   }) {
+    const existing = this.repos.channels.findById(input.channelId);
+    if (!existing || existing.serverId !== input.serverId) {
+      return null;
+    }
+
     const channel = this.repos.channels.update(input.channelId, {
       locked: input.locked,
       slowmodeSeconds: input.slowmodeSeconds,
@@ -259,6 +300,11 @@ export class ModerationService {
     actorId: string;
     patch: Partial<Omit<AutomodRule, 'id' | 'serverId' | 'createdAt'>>;
   }): AutomodRule | null {
+    const existing = this.repos.automod.list(input.serverId).find((rule) => rule.id === input.ruleId);
+    if (!existing) {
+      return null;
+    }
+
     const rule = this.repos.automod.update(input.ruleId, input.patch);
     if (!rule) {
       return null;
@@ -276,7 +322,12 @@ export class ModerationService {
     return rule;
   }
 
-  deleteAutomodRule(input: { ruleId: string; serverId: string; actorId: string }): void {
+  deleteAutomodRule(input: { ruleId: string; serverId: string; actorId: string }): boolean {
+    const existing = this.repos.automod.list(input.serverId).find((rule) => rule.id === input.ruleId);
+    if (!existing) {
+      return false;
+    }
+
     this.repos.automod.delete(input.ruleId);
     this.repos.audit.create({
       serverId: input.serverId,
@@ -286,6 +337,7 @@ export class ModerationService {
       targetId: input.ruleId,
       payload: {},
     });
+    return true;
   }
 
   listAuditLogs(serverId: string, limit = 100) {

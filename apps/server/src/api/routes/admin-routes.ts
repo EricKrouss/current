@@ -17,6 +17,7 @@ const PermissionSchema = z.enum([
   'MANAGE_ROLES',
   'MODERATE_MEMBERS',
   'MANAGE_MESSAGES',
+  'VIEW_CHANNEL',
   'SEND_MESSAGES',
   'CONNECT_VOICE',
   'SPEAK_VOICE',
@@ -140,7 +141,7 @@ const AdminSettingsPatchSchema = z
         announcedIp: z.string().trim().min(1).max(255).optional(),
         udpMinPort: z.number().int().min(1).max(65535).optional(),
         udpMaxPort: z.number().int().min(1).max(65535).optional(),
-        workerCount: z.number().int().min(1).max(8).optional(),
+        workerCount: z.number().int().min(0).max(8).optional(),
         sessionTimeoutMs: z.number().int().min(5_000).max(600_000).optional(),
         turnUrls: z.array(z.string().trim().min(1).max(2048)).max(32).optional(),
         turnUsername: z.string().max(4096).optional(),
@@ -809,6 +810,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         fileName: `${query.data.kind}-${file.filename}`,
         mimeType: file.mimetype,
         bytes,
+        ownerUserId: request.currentUser.id,
       });
       reply.code(201).send({
         ...attachment,

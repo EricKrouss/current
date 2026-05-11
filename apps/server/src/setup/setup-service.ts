@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { isAbsolute, relative, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { CurrentUser, RegistrationMode, UserPresenceStatus } from '@current/types';
 import { ALL_PERMISSIONS } from '../moderation/permissions.js';
@@ -89,7 +90,7 @@ export class SetupService {
       name: 'Member',
       color: '#6bd7ff',
       position: 1,
-      permissions: ['SEND_MESSAGES', 'CONNECT_VOICE', 'SPEAK_VOICE', 'ATTACH_FILES', 'USE_GIFS'],
+      permissions: ['VIEW_CHANNEL', 'SEND_MESSAGES', 'CONNECT_VOICE', 'SPEAK_VOICE', 'ATTACH_FILES', 'USE_GIFS'],
     });
 
     const generalChannel = this.repos.channels.create({
@@ -250,7 +251,11 @@ export class SetupService {
 
   private deleteAttachmentFiles(paths: string[]): number {
     let deleted = 0;
+    const uploadDir = this.serverConfig.get().storage.uploadDir;
     for (const path of new Set(paths)) {
+      if (!this.isUploadPath(uploadDir, path)) {
+        continue;
+      }
       if (!existsSync(path)) {
         continue;
       }
@@ -258,6 +263,11 @@ export class SetupService {
       deleted += 1;
     }
     return deleted;
+  }
+
+  private isUploadPath(uploadDir: string, filePath: string): boolean {
+    const relativePath = relative(resolve(uploadDir), resolve(filePath));
+    return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
   }
 
   private clearServerData(): void {
@@ -270,6 +280,7 @@ export class SetupService {
         'messages',
         'channel_overwrites',
         'invites',
+        'access_requests',
         'automod_rules',
         'moderation_actions',
         'audit_logs',
